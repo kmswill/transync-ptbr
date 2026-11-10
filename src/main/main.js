@@ -313,6 +313,12 @@ function createMainWindow() {
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
+  mainWindow.once('ready-to-show', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
     if (pipWindow && !pipWindow.isDestroyed()) {
