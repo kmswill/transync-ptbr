@@ -70,6 +70,13 @@
     upsertPipEntry(entry);
   });
 
+  if (api.onRemovePlaceholder) {
+    api.onRemovePlaceholder(({ id }) => {
+      const el = document.getElementById(`pip_${id}`);
+      if (el) el.remove();
+    });
+  }
+
   api.onEntriesCleared(() => {
     pipFeed.querySelectorAll('.pip-item').forEach((el) => el.remove());
     if (pipEmpty) pipEmpty.style.display = 'block';

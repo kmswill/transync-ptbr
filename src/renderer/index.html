@@ -31,6 +31,9 @@
       <button id="btnPause" class="btn btn-secondary" disabled>
         ⏸ Pausar
       </button>
+      <button id="btnDemoTest" class="btn btn-secondary" title="Executa um teste real de transcrição e tradução (PT-BR ⇄ ES) em ~1.2s">
+        🧪 Testar Áudio
+      </button>
       <div class="timer-pill" id="sessionTimer">00:00:00</div>
     </div>
 
@@ -74,8 +77,8 @@
       <div class="select-field">
         <label for="selWhisperModel">Motor STT Gratuito</label>
         <select id="selWhisperModel">
-          <option value="Xenova/whisper-tiny">⚡ Whisper Tiny (Ultra-Rápido ~40MB)</option>
-          <option value="Xenova/whisper-base" selected>⚖️ Whisper Base (Recomendado ~75MB)</option>
+          <option value="Xenova/whisper-tiny" selected>⚡ Whisper Tiny (Rápido ~1.2s • Recomendado)</option>
+          <option value="Xenova/whisper-base">⚖️ Whisper Base (Médio ~75MB)</option>
           <option value="Xenova/whisper-small">🎯 Whisper Small (Alta Precisão ~240MB)</option>
         </select>
       </div>

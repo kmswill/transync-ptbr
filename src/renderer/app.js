@@ -8,6 +8,7 @@
   const btnStartStopIcon = document.getElementById('btnStartStopIcon');
   const btnStartStopLabel = document.getElementById('btnStartStopLabel');
   const btnPause = document.getElementById('btnPause');
+  const btnDemoTest = document.getElementById('btnDemoTest');
   const sessionTimer = document.getElementById('sessionTimer');
   const chkSystemAudio = document.getElementById('chkSystemAudio');
   const chkMicAudio = document.getElementById('chkMicAudio');
@@ -67,12 +68,10 @@
   let lastQuickTranslatedText = '';
   let lastQuickTranslatedLang = 'es';
 
-  // Captura de microfone WebAudio + WebSpeech
+  // Captura direta de microfone em 16kHz PCM
   let micStream = null;
   let micAudioContext = null;
   let micProcessor = null;
-  let webSpeechRecognizer = null;
-  let webSpeechActive = false;
 
   function formatDuration(sec) {
     const hrs = String(Math.floor(sec / 3600)).padStart(2, '0');
@@ -119,80 +118,6 @@
     await stopMicrophoneCapture();
     if (!chkMicAudio.checked) return;
 
-    // 1. Tenta WebSpeech API para baixa latência se disponível, mas mantém AudioContext p/ VU meter e fallback Whisper Local
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let useRawPcmForStt = true;
-
-    if (SpeechRecognition) {
-      try {
-        const rec = new SpeechRecognition();
-        const micLang = selMicLang.value === 'es' ? 'es-419' : 'pt-BR';
-        rec.lang = micLang;
-        rec.continuous = true;
-        rec.interimResults = true;
-        let currentWebSpeechId = `mic_ws_${Date.now()}`;
-
-        rec.onstart = () => {
-          webSpeechActive = true;
-          useRawPcmForStt = false;
-        };
-
-        rec.onresult = (event) => {
-          if (!isRunning || isPaused) return;
-          let interimTranscript = '';
-          let finalTranscript = '';
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            const res = event.results[i];
-            if (res.isFinal) {
-              finalTranscript += res[0].transcript;
-            } else {
-              interimTranscript += res[0].transcript;
-            }
-          }
-          if (interimTranscript.trim()) {
-            api.submitRecognizedText({
-              utteranceId: currentWebSpeechId,
-              source: 'mic',
-              text: interimTranscript.trim(),
-              isPartial: true
-            });
-          }
-          if (finalTranscript.trim()) {
-            const finishedId = currentWebSpeechId;
-            currentWebSpeechId = `mic_ws_${Date.now()}`;
-            api.submitRecognizedText({
-              utteranceId: finishedId,
-              source: 'mic',
-              text: finalTranscript.trim(),
-              isPartial: false
-            });
-          }
-        };
-
-        rec.onerror = () => {
-          webSpeechActive = false;
-          useRawPcmForStt = true;
-        };
-
-        rec.onend = () => {
-          if (isRunning && !isPaused && chkMicAudio.checked && webSpeechActive) {
-            try {
-              rec.start();
-            } catch {
-              webSpeechActive = false;
-              useRawPcmForStt = true;
-            }
-          }
-        };
-
-        rec.start();
-        webSpeechRecognizer = rec;
-      } catch {
-        useRawPcmForStt = true;
-      }
-    }
-
-    // 2. Captura WebAudio 16kHz para o medidor VU do microfone e fallback/Whisper Local
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -206,7 +131,7 @@
 
       micAudioContext = new AudioContext({ sampleRate: 16000 });
       const sourceNode = micAudioContext.createMediaStreamSource(micStream);
-      const processor = micAudioContext.createScriptProcessor(2048, 1, 1);
+      const processor = micAudioContext.createScriptProcessor(1024, 1, 1);
 
       processor.onaudioprocess = (event) => {
         if (!isRunning || isPaused || !chkMicAudio.checked) return;
@@ -219,13 +144,11 @@
           sumSq += s * s;
         }
         const rms = Math.sqrt(sumSq / input.length);
-        const level = Math.min(100, Math.round(rms * 320));
+        const level = Math.min(100, Math.round(rms * 350));
         meterMicFill.style.width = `${level}%`;
 
-        // Se o WebSpeech não estiver ativo no Electron, envia o PCM 16kHz para o Whisper Local no Main Process
-        if (useRawPcmForStt) {
-          api.sendMicPcm(int16);
-        }
+        // Envia imediatamente o frame PCM 16kHz (64ms) para o VAD no Main Process
+        api.sendMicPcm(int16);
       };
 
       sourceNode.connect(processor);
@@ -237,14 +160,6 @@
   }
 
   async function stopMicrophoneCapture() {
-    webSpeechActive = false;
-    if (webSpeechRecognizer) {
-      try {
-        webSpeechRecognizer.onend = null;
-        webSpeechRecognizer.stop();
-      } catch {}
-      webSpeechRecognizer = null;
-    }
     if (micProcessor) {
       try {
         micProcessor.disconnect();
@@ -264,6 +179,14 @@
     meterMicFill.style.width = '0%';
   }
 
+  function removePlaceholderById(id) {
+    if (!id) return;
+    const origCard = document.getElementById(`orig_${id}`);
+    const transCard = document.getElementById(`trans_${id}`);
+    if (origCard && origCard.classList.contains('partial')) origCard.remove();
+    if (transCard && transCard.classList.contains('partial')) transCard.remove();
+  }
+
   function renderUtterance(entry) {
     if (!entry || !entry.id) return;
 
@@ -276,7 +199,6 @@
     let origCard = document.getElementById(origCardId);
     let transCard = document.getElementById(transCardId);
 
-    const isNew = !origCard;
     if (!origCard) {
       origCard = document.createElement('div');
       origCard.id = origCardId;
@@ -300,7 +222,7 @@
         <span class="speaker-badge ${sourceClass}">${speakerIcon} ${escapeHtml(entry.speakerName)}</span>
         <div>
           <span class="lang-pill">${sourceLangLabel}</span>
-          <span>${escapeHtml(entry.timestamp || '')}${entry.isPartial ? ' • ouvindo...' : ''}</span>
+          <span>${escapeHtml(entry.timestamp || '')}</span>
         </div>
       </div>
       <div class="utterance-text">${escapeHtml(entry.sourceText)}</div>
@@ -314,35 +236,36 @@
         <span>${escapeHtml(entry.timestamp || '')}</span>
       </div>
       <div class="utterance-text ${transColorClass}">${escapeHtml(entry.translatedText)}</div>
-      <div class="card-actions">
-        <button class="card-action-btn btn-speak" title="Ouvir em voz alta">🔊 Ouvir</button>
-        <button class="card-action-btn btn-copy" title="Copiar tradução">📋 Copiar</button>
-      </div>
+      ${
+        entry.isPartial
+          ? ''
+          : `<div class="card-actions">
+               <button class="card-action-btn btn-speak" title="Ouvir em voz alta">🔊 Ouvir</button>
+               <button class="card-action-btn btn-copy" title="Copiar tradução">📋 Copiar</button>
+             </div>`
+      }
     `;
 
-    const btnSpeak = transCard.querySelector('.btn-speak');
-    const btnCopy = transCard.querySelector('.btn-copy');
-    if (btnSpeak) {
-      btnSpeak.onclick = () => speakText(entry.translatedText, entry.targetLang);
-    }
-    if (btnCopy) {
-      btnCopy.onclick = () => {
-        navigator.clipboard.writeText(entry.translatedText);
-        btnCopy.textContent = '✓ Copiado!';
-        setTimeout(() => {
-          btnCopy.textContent = '📋 Copiar';
-        }, 1200);
-      };
+    if (!entry.isPartial) {
+      const btnSpeak = transCard.querySelector('.btn-speak');
+      const btnCopy = transCard.querySelector('.btn-copy');
+      if (btnSpeak) {
+        btnSpeak.onclick = () => speakText(entry.translatedText, entry.targetLang);
+      }
+      if (btnCopy) {
+        btnCopy.onclick = () => {
+          navigator.clipboard.writeText(entry.translatedText);
+          btnCopy.textContent = '✓ Copiado!';
+          setTimeout(() => {
+            btnCopy.textContent = '📋 Copiar';
+          }, 1200);
+        };
+      }
     }
 
-    if (isNew && !entry.isPartial) {
-      utteranceCount += 1;
-      countBadge.textContent = `${utteranceCount} intervenções`;
-    } else if (!entry.isPartial) {
-      const finalizedCards = originalList.querySelectorAll('.utterance-card:not(.partial)').length;
-      utteranceCount = finalizedCards;
-      countBadge.textContent = `${utteranceCount} intervenções`;
-    }
+    const finalizedCards = originalList.querySelectorAll('.utterance-card:not(.partial)').length;
+    utteranceCount = finalizedCards;
+    countBadge.textContent = `${utteranceCount} intervenções`;
 
     originalList.scrollTop = originalList.scrollHeight;
     translationList.scrollTop = translationList.scrollHeight;
@@ -426,15 +349,25 @@
     updateControlsUI();
   });
 
+  if (btnDemoTest) {
+    btnDemoTest.addEventListener('click', async () => {
+      btnDemoTest.disabled = true;
+      btnDemoTest.textContent = '⏳ Testando (~1.2s)...';
+      try {
+        await api.runDemoTest();
+      } finally {
+        btnDemoTest.disabled = false;
+        btnDemoTest.textContent = '🧪 Testar Áudio';
+      }
+    });
+  }
+
   selTeamsLang.addEventListener('change', () => {
     api.updateConfig({ teamsExpectedLang: selTeamsLang.value });
   });
 
   selMicLang.addEventListener('change', () => {
     api.updateConfig({ micExpectedLang: selMicLang.value });
-    if (isRunning && !isPaused) {
-      startMicrophoneCapture();
-    }
   });
 
   selWhisperModel.addEventListener('change', () => {
@@ -548,6 +481,12 @@
     renderUtterance(entry);
   });
 
+  if (api.onRemovePlaceholder) {
+    api.onRemovePlaceholder(({ id }) => {
+      removePlaceholderById(id);
+    });
+  }
+
   api.onAudioLevel(({ source, level }) => {
     if (source === 'system') {
       meterSystemFill.style.width = `${level}%`;
@@ -593,7 +532,7 @@
     currentGlossary = state.glossary || [];
     selTeamsLang.value = state.teamsExpectedLang || 'es';
     selMicLang.value = state.micExpectedLang || 'pt-BR';
-    selWhisperModel.value = state.whisperModel || 'Xenova/whisper-base';
+    selWhisperModel.value = state.whisperModel || 'Xenova/whisper-tiny';
     if (Array.isArray(state.entries)) {
       state.entries.forEach((entry) => renderUtterance(entry));
     }

@@ -17,7 +17,7 @@ function calculateAudioLevel(int16Samples) {
     sumSq += norm * norm;
   }
   const rms = Math.sqrt(sumSq / int16Samples.length);
-  const level = Math.min(100, Math.round(rms * 320));
+  const level = Math.min(100, Math.round(rms * 350));
   return { rms, level };
 }
 
@@ -43,13 +43,13 @@ function encodeWav16kMono(int16Samples) {
   buffer.writeUInt32LE(36 + byteLength, 4);
   buffer.write('WAVE', 8);
   buffer.write('fmt ', 12);
-  buffer.writeUInt32LE(16, 16); // Subchunk1Size (PCM)
-  buffer.writeUInt16LE(1, 20); // AudioFormat (1 = PCM)
-  buffer.writeUInt16LE(1, 22); // NumChannels (1 = Mono)
-  buffer.writeUInt32LE(SAMPLE_RATE, 24); // SampleRate (16000)
-  buffer.writeUInt32LE(SAMPLE_RATE * 2, 28); // ByteRate
-  buffer.writeUInt16LE(2, 32); // BlockAlign
-  buffer.writeUInt16LE(16, 34); // BitsPerSample
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(SAMPLE_RATE, 24);
+  buffer.writeUInt32LE(SAMPLE_RATE * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
   buffer.write('data', 36);
   buffer.writeUInt32LE(byteLength, 40);
 
@@ -77,20 +77,21 @@ function concatInt16Chunks(chunks) {
 }
 
 /**
- * Segmentador de voz em tempo real (VAD) para fluxos PCM 16kHz.
- * Emite eventos 'level', 'partial' (enquanto a pessoa ainda está falando)
- * e 'final' (assim que faz uma pausa natural).
+ * Segmentador de voz em tempo real (VAD) otimizado para baixa latência:
+ * - Piso de ruído adaptativo (ignora chiado constante do microfone)
+ * - Hangover curto (360ms) para fechar frases rapidamente nas pausas
+ * - Janela máxima curta (3500ms) para fatiar discursos contínuos em tempo real
  */
 class RealtimeVadSegmenter extends EventEmitter {
   constructor(options = {}) {
     super();
     this.source = options.source || 'system';
-    this.speechThresholdRms = options.speechThresholdRms ?? 0.011;
-    this.silenceHangoverMs = options.silenceHangoverMs ?? 560;
-    this.minSpeechMs = options.minSpeechMs ?? 420;
-    this.maxSegmentMs = options.maxSegmentMs ?? 8500;
-    this.partialIntervalMs = options.partialIntervalMs ?? 1600;
-    this.preRollMaxChunks = options.preRollMaxChunks ?? 5;
+    this.speechThresholdRms = options.speechThresholdRms ?? 0.012;
+    this.silenceHangoverMs = options.silenceHangoverMs ?? 360;
+    this.minSpeechMs = options.minSpeechMs ?? 320;
+    this.maxSegmentMs = options.maxSegmentMs ?? 3500;
+    this.partialIntervalMs = options.partialIntervalMs ?? 0;
+    this.preRollMaxChunks = options.preRollMaxChunks ?? 4;
 
     this.reset();
   }
@@ -105,6 +106,7 @@ class RealtimeVadSegmenter extends EventEmitter {
     this.speaking = false;
     this.currentUtteranceId = null;
     this.utteranceCounter = this.utteranceCounter || 0;
+    this.noiseFloorRms = 0.004;
   }
 
   pushPcm(int16Samples) {
@@ -116,7 +118,16 @@ class RealtimeVadSegmenter extends EventEmitter {
     const { rms, level } = calculateAudioLevel(int16Samples);
     this.emit('level', { source: this.source, rms, level });
 
-    const isVoiced = rms >= this.speechThresholdRms;
+    // Atualiza piso de ruído adaptativo quando não está falando
+    if (!this.speaking && rms < this.speechThresholdRms * 1.5) {
+      this.noiseFloorRms = this.noiseFloorRms * 0.92 + rms * 0.08;
+    }
+
+    const dynamicThreshold = Math.max(
+      this.speechThresholdRms,
+      Math.min(0.045, this.noiseFloorRms * 2.4)
+    );
+    const isVoiced = rms >= dynamicThreshold;
 
     if (!this.speaking) {
       this.preRollChunks.push(int16Samples);
@@ -134,11 +145,16 @@ class RealtimeVadSegmenter extends EventEmitter {
         this.voicedSampleCount = int16Samples.length;
         this.silenceMs = 0;
         this.sinceLastPartialMs = 0;
+
+        this.emit('speech-start', {
+          source: this.source,
+          utteranceId: this.currentUtteranceId
+        });
       }
       return;
     }
 
-    // Já estamos em um segmento de fala ativo
+    // Fala ativa
     this.activeChunks.push(int16Samples);
     this.activeSampleCount += int16Samples.length;
 
@@ -197,6 +213,7 @@ class RealtimeVadSegmenter extends EventEmitter {
     this.currentUtteranceId = null;
 
     if (voicedDurationMs < this.minSpeechMs) {
+      this.emit('speech-cancel', { source: this.source, utteranceId });
       return;
     }
 

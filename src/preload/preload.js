@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('transyncAPI', {
   stopSession: () => ipcRenderer.invoke('transync:stop-session'),
   sendMicPcm: (int16Samples) => ipcRenderer.send('transync:mic-pcm', int16Samples),
   submitRecognizedText: (payload) => ipcRenderer.invoke('transync:submit-recognized-text', payload),
+  runDemoTest: () => ipcRenderer.invoke('transync:run-demo-test'),
   quickTranslate: (payload) => ipcRenderer.invoke('transync:quick-translate', payload),
   updateConfig: (partialConfig) => ipcRenderer.invoke('transync:update-config', partialConfig),
   clearEntries: () => ipcRenderer.invoke('transync:clear-entries'),
@@ -26,6 +27,7 @@ contextBridge.exposeInMainWorld('transyncAPI', {
   openExternal: (url) => ipcRenderer.invoke('transync:open-external', url),
 
   onUtterance: (cb) => subscribe('transync:utterance', cb),
+  onRemovePlaceholder: (cb) => subscribe('transync:remove-placeholder', cb),
   onAudioLevel: (cb) => subscribe('transync:audio-level', cb),
   onModelStatus: (cb) => subscribe('transync:model-status', cb),
   onLoopbackStatus: (cb) => subscribe('transync:loopback-status', cb),

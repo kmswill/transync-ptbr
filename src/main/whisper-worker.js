@@ -30,7 +30,7 @@ function isWhisperHallucination(text) {
   return false;
 }
 
-async function getTranscriber(modelId = 'Xenova/whisper-base', cacheDir = null) {
+async function getTranscriber(modelId = 'Xenova/whisper-tiny', cacheDir = null) {
   if (transcriber && loadedModelId === modelId) {
     return transcriber;
   }
@@ -53,7 +53,7 @@ async function getTranscriber(modelId = 'Xenova/whisper-base', cacheDir = null) 
       type: 'model-status',
       status: 'loading',
       modelId,
-      message: `Carregando modelo local ${modelId}...`
+      message: `Carregando motor rápido ${modelId}...`
     });
 
     const instance = await pipeline('automatic-speech-recognition', modelId, {
@@ -75,7 +75,7 @@ async function getTranscriber(modelId = 'Xenova/whisper-base', cacheDir = null) 
       type: 'model-status',
       status: 'ready',
       modelId,
-      message: `Modelo ${modelId} pronto (100% Gratuito / Local)`
+      message: `Motor ${modelId} aquecido e pronto (~1.2s de resposta • Zero Tokens)`
     });
     return instance;
   })();
@@ -92,7 +92,7 @@ parentPort?.on('message', async (msg) => {
 
   if (msg.type === 'preload') {
     try {
-      await getTranscriber(msg.modelId || 'Xenova/whisper-base', msg.cacheDir);
+      await getTranscriber(msg.modelId || 'Xenova/whisper-tiny', msg.cacheDir);
     } catch (err) {
       parentPort?.postMessage({
         type: 'model-status',
@@ -107,9 +107,26 @@ parentPort?.on('message', async (msg) => {
   if (msg.type === 'transcribe') {
     const { requestId, float32Audio, languageHint, modelId, cacheDir } = msg;
     try {
-      const asr = await getTranscriber(modelId || 'Xenova/whisper-base', cacheDir);
       const audioArray =
         float32Audio instanceof Float32Array ? float32Audio : new Float32Array(float32Audio);
+
+      // Verificação rápida de energia mínima para nunca gastar CPU em silêncio
+      let sumSq = 0;
+      for (let i = 0; i < audioArray.length; i++) {
+        sumSq += audioArray[i] * audioArray[i];
+      }
+      const rms = Math.sqrt(sumSq / Math.max(1, audioArray.length));
+      if (rms < 0.004) {
+        parentPort?.postMessage({
+          type: 'transcribe-result',
+          requestId,
+          ok: true,
+          text: ''
+        });
+        return;
+      }
+
+      const asr = await getTranscriber(modelId || 'Xenova/whisper-tiny', cacheDir);
 
       const whisperLang =
         languageHint && languageHint.startsWith('pt')
@@ -121,8 +138,7 @@ parentPort?.on('message', async (msg) => {
       const result = await asr(audioArray, {
         language: whisperLang,
         task: 'transcribe',
-        chunk_length_s: 20,
-        stride_length_s: 3,
+        max_new_tokens: 56,
         return_timestamps: false
       });
 

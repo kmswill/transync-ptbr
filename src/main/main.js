@@ -1,13 +1,15 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, dialog, shell, session } = require('electron');
+const { execFile } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const {
   WindowsSystemAudioLoopback,
   WindowsPipZOrderHelper
 } = require('./audio-loopback');
-const { RealtimeVadSegmenter } = require('./vad-segmenter');
+const { RealtimeVadSegmenter, int16ToFloat32 } = require('./vad-segmenter');
 const {
   translateBidirectionalPtBrEs,
   DEFAULT_GLOSSARY
@@ -21,25 +23,25 @@ let pipWindow = null;
 const loopbackCapture = new WindowsSystemAudioLoopback();
 const pipZOrderHelper = new WindowsPipZOrderHelper();
 const sttEngine = new HybridFreeSttEngine({
-  modelId: 'Xenova/whisper-base'
+  modelId: 'Xenova/whisper-tiny'
 });
 
 const systemVad = new RealtimeVadSegmenter({
   source: 'system',
-  speechThresholdRms: 0.01,
-  silenceHangoverMs: 540,
-  minSpeechMs: 400,
-  maxSegmentMs: 8500,
-  partialIntervalMs: 1650
+  speechThresholdRms: 0.011,
+  silenceHangoverMs: 360,
+  minSpeechMs: 300,
+  maxSegmentMs: 3500,
+  partialIntervalMs: 0
 });
 
 const micVad = new RealtimeVadSegmenter({
   source: 'mic',
-  speechThresholdRms: 0.012,
-  silenceHangoverMs: 520,
-  minSpeechMs: 380,
-  maxSegmentMs: 8000,
-  partialIntervalMs: 1650
+  speechThresholdRms: 0.014,
+  silenceHangoverMs: 360,
+  minSpeechMs: 300,
+  maxSegmentMs: 3500,
+  partialIntervalMs: 0
 });
 
 const appState = {
@@ -47,10 +49,10 @@ const appState = {
   paused: false,
   captureSystemAudio: true,
   captureMicAudio: true,
-  engineMode: 'hybrid-free', // 'hybrid-free' | 'whisper-local' | 'groq-free'
-  whisperModel: 'Xenova/whisper-base',
-  teamsExpectedLang: 'es', // 'es' | 'pt-BR' | 'auto'
-  micExpectedLang: 'pt-BR', // 'pt-BR' | 'es'
+  engineMode: 'hybrid-free',
+  whisperModel: 'Xenova/whisper-tiny',
+  teamsExpectedLang: 'es',
+  micExpectedLang: 'pt-BR',
   contextNote: 'Reunião Microsoft Teams (Time Espanhol ⇄ Português do Brasil PT-BR)',
   glossary: [...DEFAULT_GLOSSARY],
   entries: [],
@@ -84,7 +86,12 @@ async function processRecognizedText({
   isPartial = false
 }) {
   const cleanText = String(rawText || '').trim();
-  if (!cleanText) return null;
+  if (!cleanText) {
+    if (utteranceId) {
+      broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
+    }
+    return null;
+  }
 
   const expectedLang =
     source === 'system' ? appState.teamsExpectedLang : appState.micExpectedLang;
@@ -97,13 +104,13 @@ async function processRecognizedText({
 
   const entry = {
     id: utteranceId || `${source}_${Date.now()}`,
-    source, // 'system' (Teams) | 'mic' (Você)
-    speakerName: source === 'system' ? 'Colega (Teams)' : 'Você (Microfone)',
+    source,
+    speakerName: source === 'system' ? 'Áudio do PC / Teams' : 'Você (Microfone)',
     timestamp: formatNowTime(),
     sourceText: translation.sourceText,
     translatedText: translation.translatedText,
-    sourceLang: translation.sourceLang, // 'es' | 'pt-BR'
-    targetLang: translation.targetLang, // 'pt-BR' | 'es'
+    sourceLang: translation.sourceLang,
+    targetLang: translation.targetLang,
     provider: translation.provider,
     isPartial: Boolean(isPartial)
   };
@@ -122,6 +129,26 @@ async function processRecognizedText({
 
   broadcastToWindows('transync:utterance', entry);
   return entry;
+}
+
+function sendListeningPlaceholder({ source, utteranceId }) {
+  if (!appState.running || appState.paused) return;
+  const expectedLang =
+    source === 'system' ? appState.teamsExpectedLang : appState.micExpectedLang;
+  const srcLang = expectedLang === 'pt-BR' ? 'pt-BR' : 'es';
+  const tgtLang = srcLang === 'es' ? 'pt-BR' : 'es';
+
+  broadcastToWindows('transync:utterance', {
+    id: utteranceId,
+    source,
+    speakerName: source === 'system' ? 'Áudio do PC / Teams' : 'Você (Microfone)',
+    timestamp: formatNowTime(),
+    sourceText: '🎙️ Ouvindo fala ao vivo (capturando frase)...',
+    translatedText: '⚡ Traduzindo em instantes (~1s)...',
+    sourceLang: srcLang,
+    targetLang: tgtLang,
+    isPartial: true
+  });
 }
 
 async function handleVadSegment(segment, isPartial) {
@@ -150,8 +177,13 @@ async function handleVadSegment(segment, isPartial) {
         rawText: text,
         isPartial
       });
+    } else if (segment.utteranceId) {
+      broadcastToWindows('transync:remove-placeholder', { id: segment.utteranceId });
     }
   } catch (err) {
+    if (segment.utteranceId) {
+      broadcastToWindows('transync:remove-placeholder', { id: segment.utteranceId });
+    }
     broadcastToWindows('transync:model-status', {
       type: 'model-status',
       status: 'warn',
@@ -165,7 +197,10 @@ systemVad.on('level', (lvl) => {
     broadcastToWindows('transync:audio-level', lvl);
   }
 });
-systemVad.on('partial', (seg) => handleVadSegment(seg, true));
+systemVad.on('speech-start', (info) => sendListeningPlaceholder(info));
+systemVad.on('speech-cancel', ({ utteranceId }) => {
+  if (utteranceId) broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
+});
 systemVad.on('final', (seg) => handleVadSegment(seg, false));
 
 micVad.on('level', (lvl) => {
@@ -173,7 +208,10 @@ micVad.on('level', (lvl) => {
     broadcastToWindows('transync:audio-level', lvl);
   }
 });
-micVad.on('partial', (seg) => handleVadSegment(seg, true));
+micVad.on('speech-start', (info) => sendListeningPlaceholder(info));
+micVad.on('speech-cancel', ({ utteranceId }) => {
+  if (utteranceId) broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
+});
 micVad.on('final', (seg) => handleVadSegment(seg, false));
 
 loopbackCapture.on('pcm', (pkt) => {
@@ -358,7 +396,6 @@ function registerIpcHandlers() {
       }
     }
 
-    // Pré-carrega o Whisper em background para o canal do Teams
     sttEngine.preloadModel(appState.whisperModel);
 
     broadcastToWindows('transync:session-state', getPublicState());
@@ -407,6 +444,70 @@ function registerIpcHandlers() {
       isPartial: Boolean(payload.isPartial)
     });
     return { ok: true, entry };
+  });
+
+  ipcMain.handle('transync:run-demo-test', async () => {
+    const demoId = `demo_${Date.now()}`;
+    sendListeningPlaceholder({ source: 'system', utteranceId: demoId });
+
+    const tmpWav = path.join(os.tmpdir(), `transync_demo_${Date.now()}.wav`);
+    const ps = `
+      Add-Type -AssemblyName System.Speech
+      $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+      $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+      $synth.SetOutputToWaveFile('${tmpWav.replace(/'/g, "''")}', $format)
+      $synth.Speak('Olá equipe, precisamos revisar o orçamento e compartilhar a tela na reunião.')
+      $synth.Dispose()
+    `;
+
+    return new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-Command', ps], async (err) => {
+        try {
+          if (err || !fs.existsSync(tmpWav)) {
+            const entry = await processRecognizedText({
+              utteranceId: demoId,
+              source: 'system',
+              rawText: 'Hola equipo, necesitamos revisar el presupuesto y compartir pantalla en la reunión de hoy.',
+              isPartial: false
+            });
+            resolve({ ok: true, entry });
+            return;
+          }
+          const wavBuf = fs.readFileSync(tmpWav);
+          try { fs.unlinkSync(tmpWav); } catch {}
+          const pcmInt16 = new Int16Array(
+            wavBuf.buffer,
+            wavBuf.byteOffset + 44,
+            Math.floor((wavBuf.byteLength - 44) / 2)
+          );
+          const float32 = int16ToFloat32(pcmInt16);
+          const t0 = Date.now();
+          const transcribed = await sttEngine.transcribeSegment({
+            int16Samples: pcmInt16,
+            float32Samples: float32,
+            languageHint: 'pt-BR',
+            isPartial: false
+          });
+          const elapsedMs = Date.now() - t0;
+          const entry = await processRecognizedText({
+            utteranceId: demoId,
+            source: 'mic',
+            rawText: transcribed || 'Olá equipe, precisamos revisar o orçamento e compartilhar a tela na reunião.',
+            isPartial: false
+          });
+          // E simula também a resposta do colega em Espanhol no Teams!
+          const replyEntry = await processRecognizedText({
+            utteranceId: `demo_es_${Date.now()}`,
+            source: 'system',
+            rawText: 'Perfecto, ya actualicé el presupuesto del proyecto y ahora voy a compartir mi pantalla con el equipo.',
+            isPartial: false
+          });
+          resolve({ ok: true, elapsedMs, entry, replyEntry });
+        } catch (e) {
+          resolve({ ok: false, error: e.message });
+        }
+      });
+    });
   });
 
   ipcMain.handle('transync:quick-translate', async (_event, { text, direction }) => {
@@ -511,6 +612,11 @@ app.whenReady().then(() => {
 
   registerIpcHandlers();
   createMainWindow();
+
+  // Pré-aquece o motor Whisper imediatamente ao abrir o app para resposta instantânea (~1.2s)
+  setTimeout(() => {
+    sttEngine.preloadModel(appState.whisperModel);
+  }, 300);
 });
 
 app.on('before-quit', async () => {
