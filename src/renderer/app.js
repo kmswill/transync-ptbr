@@ -15,6 +15,8 @@
   const meterSystemFill = document.getElementById('meterSystemFill');
   const meterMicFill = document.getElementById('meterMicFill');
 
+  const selTargetApp = document.getElementById('selTargetApp');
+  const btnRefreshApps = document.getElementById('btnRefreshApps');
   const selTeamsLang = document.getElementById('selTeamsLang');
   const selMicLang = document.getElementById('selMicLang');
   const selWhisperModel = document.getElementById('selWhisperModel');
@@ -314,12 +316,43 @@
     });
   }
 
+  async function refreshRunningApps(selectedValue) {
+    if (!selTargetApp || !api.listApps) return;
+    const currentVal = selectedValue || selTargetApp.value || 'teams-only';
+    try {
+      const res = await api.listApps();
+      const apps = Array.isArray(res?.apps) ? res.apps : [];
+      selTargetApp.innerHTML = '';
+
+      const optTeams = document.createElement('option');
+      optTeams.value = 'teams-only';
+      optTeams.textContent = '🟣 Só Microsoft Teams (Ignorar notificações)';
+      selTargetApp.appendChild(optTeams);
+
+      for (const appInfo of apps) {
+        const opt = document.createElement('option');
+        opt.value = appInfo.id;
+        opt.textContent = `🎯 Só ${appInfo.label}`;
+        selTargetApp.appendChild(opt);
+      }
+
+      const optAll = document.createElement('option');
+      optAll.value = 'all';
+      optAll.textContent = '🔊 Todo o Áudio do PC';
+      selTargetApp.appendChild(optAll);
+
+      const exists = Array.from(selTargetApp.options).some((o) => o.value === currentVal);
+      selTargetApp.value = exists ? currentVal : 'teams-only';
+    } catch {}
+  }
+
   // Eventos de Botões
   btnStartStop.addEventListener('click', async () => {
     if (!isRunning) {
       const res = await api.startSession({
         captureSystemAudio: chkSystemAudio.checked,
         captureMicAudio: chkMicAudio.checked,
+        targetApp: selTargetApp ? selTargetApp.value : 'teams-only',
         teamsExpectedLang: selTeamsLang.value,
         micExpectedLang: selMicLang.value,
         whisperModel: selWhisperModel.value,
@@ -359,6 +392,18 @@
         btnDemoTest.disabled = false;
         btnDemoTest.textContent = '🧪 Testar Áudio';
       }
+    });
+  }
+
+  if (selTargetApp) {
+    selTargetApp.addEventListener('change', () => {
+      api.updateConfig({ targetApp: selTargetApp.value });
+    });
+  }
+
+  if (btnRefreshApps) {
+    btnRefreshApps.addEventListener('click', () => {
+      refreshRunningApps();
     });
   }
 
@@ -528,8 +573,9 @@
   });
 
   // Inicialização
-  api.getState().then((state) => {
+  api.getState().then(async (state) => {
     currentGlossary = state.glossary || [];
+    await refreshRunningApps(state.targetApp || 'teams-only');
     selTeamsLang.value = state.teamsExpectedLang || 'auto';
     selMicLang.value = state.micExpectedLang || 'pt-BR';
     selWhisperModel.value = state.whisperModel || 'Xenova/whisper-tiny';

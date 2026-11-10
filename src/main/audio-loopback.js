@@ -1,13 +1,110 @@
 'use strict';
 
 const { EventEmitter } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const LOOPBACK_BINARY_NAME = 'transync-win-process-loopback-helper.exe';
 const PIP_ZORDER_BINARY_NAME = 'transync-win-pip-z-order-helper.exe';
 const TARGET_SAMPLE_RATE = 16000;
+
+const KNOWN_AUDIO_APPS = [
+  { exe: 'ms-teams.exe', label: '🟣 Microsoft Teams (App Desktop)', priority: 1 },
+  { exe: 'Teams.exe', label: '🟣 Microsoft Teams (Classic)', priority: 2 },
+  { exe: 'chrome.exe', label: '🌐 Google Chrome (Teams Web / YouTube / Meet)', priority: 3 },
+  { exe: 'msedge.exe', label: '🌐 Microsoft Edge (Teams Web / YouTube)', priority: 4 },
+  { exe: 'Zoom.exe', label: '🎥 Zoom Meetings', priority: 5 },
+  { exe: 'brave.exe', label: '🦁 Brave Browser', priority: 6 },
+  { exe: 'firefox.exe', label: '🦊 Mozilla Firefox', priority: 7 },
+  { exe: 'opera.exe', label: '🌐 Opera Browser', priority: 8 },
+  { exe: 'Discord.exe', label: '💬 Discord', priority: 9 },
+  { exe: 'Slack.exe', label: '💬 Slack', priority: 10 },
+  { exe: 'Spotify.exe', label: '🎵 Spotify', priority: 11 },
+  { exe: 'vlc.exe', label: '🎬 VLC Media Player', priority: 12 }
+];
+
+/**
+ * Lista os processos em execução no Windows e identifica o PID Raiz (Root PID)
+ * de cada aplicativo de áudio/reunião aberto para uso com WASAPI include-tree.
+ */
+function listRunningAudioApps() {
+  if (process.platform !== 'win32') {
+    return Promise.resolve([]);
+  }
+
+  const psCmd =
+    'Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name | ConvertTo-Json -Compress';
+
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-Command', psCmd],
+      { timeout: 5000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          resolve([]);
+          return;
+        }
+        try {
+          const raw = JSON.parse(stdout.trim());
+          const list = Array.isArray(raw) ? raw : [raw];
+          const byPid = new Map();
+          for (const proc of list) {
+            if (proc && Number.isInteger(proc.ProcessId)) {
+              byPid.set(proc.ProcessId, {
+                pid: proc.ProcessId,
+                ppid: proc.ParentProcessId || 0,
+                name: String(proc.Name || '')
+              });
+            }
+          }
+
+          const results = [];
+          for (const known of KNOWN_AUDIO_APPS) {
+            const targetLower = known.exe.toLowerCase();
+            const matching = [];
+            for (const proc of byPid.values()) {
+              if (proc.name.toLowerCase() === targetLower) {
+                matching.push(proc);
+              }
+            }
+            if (matching.length === 0) continue;
+
+            // Encontra os processos raiz cujo pai NÃO tem o mesmo nome de executável
+            const roots = matching.filter((proc) => {
+              const parent = byPid.get(proc.ppid);
+              return !parent || parent.name.toLowerCase() !== targetLower;
+            });
+
+            // Escolhe o raiz que possui mais filhos na árvore (normalmente o processo principal do app)
+            let bestRoot = roots[0] || matching[0];
+            let bestChildCount = -1;
+            for (const candidate of roots) {
+              const children = matching.filter((m) => m.ppid === candidate.pid).length;
+              if (children > bestChildCount) {
+                bestChildCount = children;
+                bestRoot = candidate;
+              }
+            }
+
+            results.push({
+              id: `exe:${known.exe}`,
+              exe: known.exe,
+              rootPid: bestRoot.pid,
+              processCount: matching.length,
+              label: `${known.label} (PID ${bestRoot.pid})`
+            });
+          }
+
+          resolve(results);
+        } catch {
+          resolve([]);
+        }
+      }
+    );
+  });
+}
 
 /**
  * Localiza um binário helper nativo do Windows priorizando a pasta local do projeto
@@ -87,9 +184,10 @@ function decodeBase64PcmInt16(pcmBase64) {
 }
 
 /**
- * Gerenciador do helper WASAPI Process Loopback (ActivateAudioInterfaceAsync)
- * que captura todo o áudio do sistema (Microsoft Teams, Zoom, navegador)
- * excluindo a árvore de processos do próprio aplicativo para evitar loop de eco.
+ * Gerenciador do helper WASAPI Process Loopback (ActivateAudioInterfaceAsync):
+ * - Modo 'include-tree': captura SOMENTE o áudio da árvore de processos do aplicativo escolhido
+ *   (ex: só Microsoft Teams ou só Google Chrome), ignorando notificações, WhatsApp, e-mails etc.
+ * - Modo 'exclude-tree': captura todo o áudio do PC exceto o próprio Transync.
  */
 class WindowsSystemAudioLoopback extends EventEmitter {
   constructor() {
@@ -109,11 +207,18 @@ class WindowsSystemAudioLoopback extends EventEmitter {
     return resolveNativeHelperPath(LOOPBACK_BINARY_NAME);
   }
 
-  async start(targetPid = process.pid) {
+  async start(targetPid = process.pid, mode = 'exclude-tree') {
     if (process.platform !== 'win32') {
       throw new Error('Captura WASAPI Process Loopback disponível apenas no Windows.');
     }
-    if (this.child && this.readyState) {
+    const normalizedMode = mode === 'include-tree' ? 'include-tree' : 'exclude-tree';
+
+    if (
+      this.child &&
+      this.readyState &&
+      this.readyState.targetProcessId === targetPid &&
+      this.readyState.requestedMode === normalizedMode
+    ) {
       return this.readyState;
     }
     if (this.child) {
@@ -143,7 +248,7 @@ class WindowsSystemAudioLoopback extends EventEmitter {
           '--target-pid',
           String(targetPid),
           '--mode',
-          'exclude-tree',
+          normalizedMode,
           '--chunk-frames',
           '1024'
         ],
@@ -172,7 +277,11 @@ class WindowsSystemAudioLoopback extends EventEmitter {
                   sampleRate: payload.sampleRate || TARGET_SAMPLE_RATE,
                   channels: payload.channels || 1,
                   targetProcessId: payload.targetProcessId || targetPid,
-                  mode: payload.mode || 'exclude-target-process-tree',
+                  requestedMode: normalizedMode,
+                  mode:
+                    normalizedMode === 'include-tree'
+                      ? 'include-target-process-tree'
+                      : payload.mode || 'exclude-target-process-tree',
                   helperPath
                 };
                 this.emit('ready', this.readyState);
@@ -310,6 +419,7 @@ class WindowsPipZOrderHelper {
 module.exports = {
   WindowsSystemAudioLoopback,
   WindowsPipZOrderHelper,
+  listRunningAudioApps,
   resolveNativeHelperPath,
   resampleInt16To16kHz,
   decodeBase64PcmInt16,

@@ -11,6 +11,7 @@ function subscribe(channel, callback) {
 contextBridge.exposeInMainWorld('transyncAPI', {
   platform: process.platform,
   getState: () => ipcRenderer.invoke('transync:get-state'),
+  listApps: () => ipcRenderer.invoke('transync:list-apps'),
   preloadWhisper: (modelId) => ipcRenderer.invoke('transync:preload-whisper', modelId),
   startSession: (config) => ipcRenderer.invoke('transync:start-session', config),
   pauseSession: (paused) => ipcRenderer.invoke('transync:pause-session', paused),

@@ -7,7 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   WindowsSystemAudioLoopback,
-  WindowsPipZOrderHelper
+  WindowsPipZOrderHelper,
+  listRunningAudioApps
 } = require('./audio-loopback');
 const { RealtimeVadSegmenter, int16ToFloat32 } = require('./vad-segmenter');
 const {
@@ -53,6 +54,7 @@ const appState = {
   paused: false,
   captureSystemAudio: true,
   captureMicAudio: true,
+  targetApp: 'teams-only',
   engineMode: 'hybrid-free',
   whisperModel: 'Xenova/whisper-tiny',
   teamsExpectedLang: 'auto',
@@ -391,6 +393,7 @@ function getPublicState() {
     paused: appState.paused,
     captureSystemAudio: appState.captureSystemAudio,
     captureMicAudio: appState.captureMicAudio,
+    targetApp: appState.targetApp,
     engineMode: appState.engineMode,
     whisperModel: appState.whisperModel,
     teamsExpectedLang: appState.teamsExpectedLang,
@@ -406,8 +409,70 @@ function getPublicState() {
   };
 }
 
+/**
+ * Inicia a captura de áudio WASAPI conforme o filtro de aplicativo escolhido:
+ * - 'teams-only': trava exclusivamente no Microsoft Teams (se aberto) ou navegador com Teams/vídeo
+ * - 'exe:<nome.exe>': trava exclusivamente naquele aplicativo (ignora notificações, WhatsApp, e-mail etc.)
+ * - 'all': ouve todo o PC exceto o próprio Transync
+ */
+async function startConfiguredLoopback() {
+  if (!appState.captureSystemAudio || !loopbackCapture.isAvailable()) {
+    await loopbackCapture.stop();
+    return { started: false, mode: 'disabled' };
+  }
+
+  const targetApp = appState.targetApp || 'teams-only';
+  if (targetApp !== 'all') {
+    const runningApps = await listRunningAudioApps();
+    let chosenApp = null;
+
+    if (targetApp === 'teams-only') {
+      chosenApp =
+        runningApps.find(
+          (a) => a.exe.toLowerCase() === 'ms-teams.exe' || a.exe.toLowerCase() === 'teams.exe'
+        ) || null;
+
+      if (!chosenApp) {
+        // Se o app desktop do Teams não estiver aberto no momento, avisa e usa captura geral sem travar a sessão
+        const status = await loopbackCapture.start(process.pid, 'exclude-tree');
+        broadcastLiveStatus(
+          'ready',
+          'ℹ️ Microsoft Teams não detectado aberto agora — ouvindo áudio do PC (abra o Teams para isolar)'
+        );
+        return status;
+      }
+    } else if (targetApp.startsWith('exe:')) {
+      const wantedExe = targetApp.slice(4).toLowerCase();
+      chosenApp = runningApps.find((a) => a.exe.toLowerCase() === wantedExe) || null;
+    } else if (targetApp.startsWith('pid:')) {
+      const pidNum = Number.parseInt(targetApp.slice(4), 10);
+      if (Number.isInteger(pidNum) && pidNum > 0) {
+        chosenApp = { exe: `PID ${pidNum}`, rootPid: pidNum };
+      }
+    }
+
+    if (chosenApp && chosenApp.rootPid) {
+      const status = await loopbackCapture.start(chosenApp.rootPid, 'include-tree');
+      broadcastLiveStatus(
+        'ready',
+        `🎯 Áudio travado SOMENTE em ${chosenApp.exe} (PID ${chosenApp.rootPid}) — notificações ignoradas`
+      );
+      return status;
+    }
+  }
+
+  const status = await loopbackCapture.start(process.pid, 'exclude-tree');
+  broadcastLiveStatus('ready', `🔊 Ouvindo áudio geral do PC (${appState.whisperModel})`);
+  return status;
+}
+
 function registerIpcHandlers() {
   ipcMain.handle('transync:get-state', () => getPublicState());
+
+  ipcMain.handle('transync:list-apps', async () => {
+    const apps = await listRunningAudioApps();
+    return { ok: true, apps };
+  });
 
   ipcMain.handle('transync:preload-whisper', (_event, modelId) => {
     sttEngine.preloadModel(modelId || appState.whisperModel);
@@ -418,6 +483,7 @@ function registerIpcHandlers() {
     Object.assign(appState, {
       captureSystemAudio: config.captureSystemAudio ?? appState.captureSystemAudio,
       captureMicAudio: config.captureMicAudio ?? appState.captureMicAudio,
+      targetApp: config.targetApp || appState.targetApp,
       engineMode: config.engineMode || appState.engineMode,
       whisperModel: config.whisperModel || appState.whisperModel,
       teamsExpectedLang: config.teamsExpectedLang || appState.teamsExpectedLang,
@@ -438,7 +504,7 @@ function registerIpcHandlers() {
     let loopbackStatus = { started: false, mode: 'disabled' };
     if (appState.captureSystemAudio && loopbackCapture.isAvailable()) {
       try {
-        loopbackStatus = await loopbackCapture.start(process.pid);
+        loopbackStatus = await startConfiguredLoopback();
         broadcastToWindows('transync:loopback-status', {
           active: true,
           ...loopbackStatus
@@ -580,7 +646,12 @@ function registerIpcHandlers() {
     });
   });
 
-  ipcMain.handle('transync:update-config', (_event, partialConfig = {}) => {
+  ipcMain.handle('transync:update-config', async (_event, partialConfig = {}) => {
+    let shouldRestartLoopback = false;
+    if (typeof partialConfig.targetApp === 'string' && partialConfig.targetApp !== appState.targetApp) {
+      appState.targetApp = partialConfig.targetApp;
+      shouldRestartLoopback = true;
+    }
     if (typeof partialConfig.teamsExpectedLang === 'string') {
       appState.teamsExpectedLang = partialConfig.teamsExpectedLang;
     }
@@ -608,6 +679,11 @@ function registerIpcHandlers() {
     }
     if (typeof partialConfig.pipFontSize === 'number') {
       appState.pipFontSize = partialConfig.pipFontSize;
+    }
+    if (shouldRestartLoopback && appState.running && appState.captureSystemAudio) {
+      try {
+        await startConfiguredLoopback();
+      } catch {}
     }
     broadcastToWindows('transync:session-state', getPublicState());
     return { ok: true, state: getPublicState() };

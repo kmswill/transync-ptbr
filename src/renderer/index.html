@@ -56,10 +56,22 @@
       </label>
     </div>
 
-    <!-- Seletor de Idiomas Explícito PT-BR ⇄ ES -->
+    <!-- Seletor de Aplicativo e Idiomas Explícito PT-BR ⇄ ES -->
     <div class="control-group lang-selectors">
       <div class="select-field">
-        <label for="selTeamsLang">Fala no Teams</label>
+        <label for="selTargetApp">🎯 Ouvir Aplicativo (Filtro anti-notificação)</label>
+        <div style="display:flex; gap:4px; align-items:center;">
+          <select id="selTargetApp" title="Escolha se quer ouvir apenas um aplicativo específico (ignorando WhatsApp, e-mail e notificações) ou o PC inteiro">
+            <option value="teams-only" selected>🟣 Só Microsoft Teams (Ignorar outros apps)</option>
+            <option value="exe:chrome.exe">🌐 Só Google Chrome (Teams Web / YouTube)</option>
+            <option value="exe:msedge.exe">🌐 Só Microsoft Edge</option>
+            <option value="all">🔊 Todo o Áudio do PC</option>
+          </select>
+          <button id="btnRefreshApps" class="btn btn-ghost" style="padding:5px 8px;" title="Atualizar lista de aplicativos abertos no Windows">🔄</button>
+        </div>
+      </div>
+      <div class="select-field">
+        <label for="selTeamsLang">Fala no App</label>
         <select id="selTeamsLang">
           <option value="auto" selected>🔄 Auto (ES ⇄ PT-BR)</option>
           <option value="es">🇪🇸 Espanhol (ES / LatAm)</option>
