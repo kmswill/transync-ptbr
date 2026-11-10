@@ -5,6 +5,7 @@
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
+    "build:exe": "node scripts/build-exe.js",
     "test": "node --test test/*.test.js"
   },
   "keywords": [
@@ -21,8 +22,7 @@
   "author": "kmswill",
   "license": "MIT",
   "dependencies": {
-    "@xenova/transformers": "^2.17.2",
-    "rea-agents": "file:../REA"
+    "@xenova/transformers": "^2.17.2"
   },
   "devDependencies": {
     "electron": "^33.2.0"

@@ -19,6 +19,9 @@ function resolveNativeHelperPath(binaryName) {
     process.resourcesPath
       ? path.join(process.resourcesPath, 'win-native-helpers', binaryName)
       : null,
+    process.execPath
+      ? path.join(path.dirname(process.execPath), 'resources', 'win-native-helpers', binaryName)
+      : null,
     path.join('C:\\Program Files\\Transync AI\\resources\\win-native-helpers', binaryName)
   ].filter(Boolean);
 

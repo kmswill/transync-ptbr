@@ -194,12 +194,14 @@ sttEngine.on('status', (statusMsg) => {
 });
 
 function createMainWindow() {
+  const iconPath = path.join(__dirname, '..', '..', 'build', 'icon.ico');
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 960,
     minHeight: 620,
     backgroundColor: '#0f131a',
+    icon: fs.existsSync(iconPath) ? iconPath : undefined,
     title: 'Transync AI PT-BR ⇄ ES (Microsoft Teams Edition — 100% Gratuito)',
     titleBarStyle: process.platform === 'win32' ? 'hidden' : 'default',
     titleBarOverlay:
@@ -243,6 +245,7 @@ function createOrTogglePipWindow(forceVisible) {
   }
 
   if (!pipWindow || pipWindow.isDestroyed()) {
+    const iconPath = path.join(__dirname, '..', '..', 'build', 'icon.ico');
     pipWindow = new BrowserWindow({
       width: 540,
       height: 250,
@@ -254,6 +257,7 @@ function createOrTogglePipWindow(forceVisible) {
       alwaysOnTop: true,
       skipTaskbar: false,
       hasShadow: true,
+      icon: fs.existsSync(iconPath) ? iconPath : undefined,
       backgroundColor: '#00000000',
       webPreferences: {
         preload: path.join(__dirname, '..', 'preload', 'preload.js'),
@@ -497,6 +501,9 @@ function registerIpcHandlers() {
 }
 
 app.whenReady().then(() => {
+  try {
+    sttEngine.cacheDir = path.join(app.getPath('userData'), 'models-cache');
+  } catch {}
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     const allowed = ['media', 'audioCapture', 'notifications', 'clipboard-sanitized-write'];
     callback(allowed.includes(permission));
