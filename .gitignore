@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.cache/
+models/
+resources/win-native-helpers/*.exe
+resources/win-native-helpers/*.dll
+*.log
+.DS_Store
+Thumbs.db
+.env

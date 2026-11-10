@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transync AI — Edição PT-BR ⇄ Espanhol (Microsoft Teams)</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- Barra de Título Customizada (Estilo Transync AI v2.7.0) -->
+  <header class="titlebar">
+    <div class="titlebar-brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">Transync AI</span>
+      <span class="brand-badge">PT-BR ⇄ ES • Zero Tokens</span>
+    </div>
+    <div class="titlebar-status" id="modelStatusBanner">
+      <span class="status-dot ready" id="modelStatusDot"></span>
+      <span id="modelStatusText">Motor Híbrido Gratuito pronto (PT-BR ⇄ Espanhol)</span>
+    </div>
+    <div class="titlebar-spacer"></div>
+  </header>
+
+  <!-- Barra de Controle Principal da Reunião -->
+  <section class="control-bar">
+    <div class="control-group primary-controls">
+      <button id="btnStartStop" class="btn btn-primary">
+        <span id="btnStartStopIcon">▶</span>
+        <span id="btnStartStopLabel">Iniciar Captura (Teams + Mic)</span>
+      </button>
+      <button id="btnPause" class="btn btn-secondary" disabled>
+        ⏸ Pausar
+      </button>
+      <div class="timer-pill" id="sessionTimer">00:00:00</div>
+    </div>
+
+    <!-- Medidores de Áudio Separados: Sistema (Teams) vs Microfone (Você) -->
+    <div class="control-group audio-meters">
+      <label class="meter-card" title="Captura o áudio do Microsoft Teams sem eco via WASAPI Process Loopback">
+        <input type="checkbox" id="chkSystemAudio" checked />
+        <span class="meter-label">🎧 Teams (Sistema)</span>
+        <div class="meter-track">
+          <div class="meter-fill system" id="meterSystemFill"></div>
+        </div>
+      </label>
+
+      <label class="meter-card" title="Captura a sua voz no microfone em Português do Brasil (PT-BR)">
+        <input type="checkbox" id="chkMicAudio" checked />
+        <span class="meter-label">🎙️ Você (Mic)</span>
+        <div class="meter-track">
+          <div class="meter-fill mic" id="meterMicFill"></div>
+        </div>
+      </label>
+    </div>
+
+    <!-- Seletor de Idiomas Explícito PT-BR ⇄ ES -->
+    <div class="control-group lang-selectors">
+      <div class="select-field">
+        <label for="selTeamsLang">Fala no Teams</label>
+        <select id="selTeamsLang">
+          <option value="es" selected>🇪🇸 Espanhol (ES / LatAm)</option>
+          <option value="auto">🔄 Auto (ES ⇄ PT-BR)</option>
+          <option value="pt-BR">🇧🇷 Português (PT-BR)</option>
+        </select>
+      </div>
+      <span class="swap-arrow">⇄</span>
+      <div class="select-field">
+        <label for="selMicLang">Sua Fala (Mic)</label>
+        <select id="selMicLang">
+          <option value="pt-BR" selected>🇧🇷 Português (Brasil PT-BR)</option>
+          <option value="es">🇪🇸 Espanhol (ES)</option>
+        </select>
+      </div>
+      <div class="select-field">
+        <label for="selWhisperModel">Motor STT Gratuito</label>
+        <select id="selWhisperModel">
+          <option value="Xenova/whisper-tiny">⚡ Whisper Tiny (Ultra-Rápido ~40MB)</option>
+          <option value="Xenova/whisper-base" selected>⚖️ Whisper Base (Recomendado ~75MB)</option>
+          <option value="Xenova/whisper-small">🎯 Whisper Small (Alta Precisão ~240MB)</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Ações Rápidas (PiP, Glossário, Ata, Exportar) -->
+    <div class="control-group action-buttons">
+      <button id="btnTogglePip" class="btn btn-accent" title="Abrir legenda flutuante Always-on-Top sobre o Microsoft Teams">
+        🪟 Legenda Flutuante (PiP)
+      </button>
+      <button id="btnOpenGlossary" class="btn btn-ghost" title="Configurar Glossário e Contexto da Reunião">
+        📖 Glossário
+      </button>
+      <button id="btnOpenSummary" class="btn btn-ghost" title="Gerar Ata e Resumo em Português do Brasil">
+        📋 Ata PT-BR
+      </button>
+      <button id="btnExport" class="btn btn-ghost" title="Exportar transcrição bilíngue">
+        💾 Exportar
+      </button>
+      <button id="btnClear" class="btn btn-ghost" title="Limpar histórico da sessão">
+        🗑️
+      </button>
+    </div>
+  </section>
+
+  <!-- Área Central: Painel Duplo Lado a Lado (Original vs Tradução PT-BR / ES) -->
+  <main class="workspace">
+    <!-- Coluna 1: Transcrição Original (Espanhol / PT-BR) -->
+    <section class="panel panel-original">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">💬</span>
+          <h2>Fala Original (Teams & Você)</h2>
+        </div>
+        <span class="panel-subtitle" id="countBadge">0 intervenções</span>
+      </div>
+      <div class="transcript-list" id="originalList">
+        <div class="empty-state" id="emptyStateOriginal">
+          <div class="empty-icon">🎧</div>
+          <h3>Pronto para sua reunião no Microsoft Teams</h3>
+          <p>
+            Clique em <strong>Iniciar Captura</strong> acima. O áudio dos seus colegas no Teams (em <strong>Espanhol</strong> ou <strong>Português</strong>) é capturado direto do sistema sem eco, e traduzido instantaneamente para <strong>Português do Brasil (PT-BR)</strong>.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Coluna 2: Tradução Simultânea (PT-BR / ES) -->
+    <section class="panel panel-translation">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">🌐</span>
+          <h2>Tradução Simultânea (Português do Brasil PT-BR ⇄ Espanhol)</h2>
+        </div>
+        <div class="panel-tags">
+          <span class="tag tag-ptbr">ES → PT-BR (Brasil)</span>
+          <span class="tag tag-es">PT-BR → ES</span>
+        </div>
+      </div>
+      <div class="transcript-list" id="translationList">
+        <div class="empty-state" id="emptyStateTranslation">
+          <div class="empty-icon">🇧🇷</div>
+          <h3>Tradução Nativa em Português do Brasil (PT-BR)</h3>
+          <p>
+            Quando alguém falar em <strong>Espanhol</strong> no Teams, você verá a tradução em <strong>Português do Brasil</strong> aqui. Quando você falar em <strong>PT-BR</strong>, verá a versão em <strong>Espanhol</strong> pronta para falar ou copiar no chat.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Barra Inferior de Resposta Rápida (Escreva em PT-BR -> Traduza/Ouça em Espanhol na hora) -->
+  <footer class="quick-reply-bar">
+    <div class="quick-reply-label">⚡ Resposta Rápida p/ Reunião:</div>
+    <input
+      type="text"
+      id="quickReplyInput"
+      class="quick-reply-input"
+      placeholder="Digite algo em Português (PT-BR) para saber como falar/enviar em Espanhol na reunião (ou vice-versa)..."
+    />
+    <button id="btnQuickTranslatePtToEs" class="btn btn-secondary btn-sm">
+      🇧🇷 PT-BR → 🇪🇸 ES
+    </button>
+    <button id="btnQuickTranslateEsToPt" class="btn btn-secondary btn-sm">
+      🇪🇸 ES → 🇧🇷 PT-BR
+    </button>
+    <div class="quick-reply-output" id="quickReplyOutput" title="Clique para copiar">
+      Tradução rápida aparecerá aqui...
+    </div>
+    <button id="btnQuickSpeak" class="btn btn-ghost btn-sm" title="Ouvir pronúncia" disabled>
+      🔊
+    </button>
+    <button id="btnQuickCopy" class="btn btn-ghost btn-sm" title="Copiar tradução" disabled>
+      📋
+    </button>
+  </footer>
+
+  <!-- Modal: Glossário Customizado & Chave Opcional Groq Free -->
+  <div class="modal-backdrop hidden" id="glossaryModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>📖 Glossário da Reunião (ES ⇄ PT-BR) & Opções</h3>
+        <button class="btn-close" id="btnCloseGlossary">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-hint">
+          Adicione termos técnicos, nomes de projetos ou jargões do seu time para garantir a tradução exata em <strong>Português do Brasil (PT-BR)</strong>:
+        </p>
+        <div class="glossary-add-row">
+          <input type="text" id="inpGlossarySource" placeholder="Termo original (ex: presupuesto)" />
+          <input type="text" id="inpGlossaryTarget" placeholder="Tradução desejada (ex: orçamento)" />
+          <select id="selGlossaryDir">
+            <option value="es->pt-BR">ES → PT-BR</option>
+            <option value="pt-BR->es">PT-BR → ES</option>
+            <option value="both">Ambos</option>
+          </select>
+          <button id="btnAddGlossary" class="btn btn-primary btn-sm">+ Adicionar</button>
+        </div>
+        <div class="glossary-list" id="glossaryList"></div>
+
+        <hr class="modal-divider" />
+        <div class="optional-cloud-box">
+          <label for="inpGroqKey">
+            🚀 <strong>Opcional — Turbo Cloud Free (Groq Whisper-Large-v3 Gratuito):</strong>
+          </label>
+          <p class="modal-hint">
+            O aplicativo já funciona 100% grátis sem chave usando Whisper Local ONNX + WebSpeech. Se quiser velocidade extra na nuvem sem gastar nada, cole uma chave gratuita da Groq (<code>gsk_...</code>):
+          </p>
+          <input
+            type="password"
+            id="inpGroqKey"
+            class="full-input"
+            placeholder="Opcional: gsk_... (Deixe em branco para usar 100% Local Gratuito)"
+          />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnSaveGlossary" class="btn btn-primary">Salvar Configurações</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Ata e Resumo da Reunião em PT-BR -->
+  <div class="modal-backdrop hidden" id="summaryModal">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <h3>📋 Ata e Resumo da Reunião em Português do Brasil (PT-BR)</h3>
+        <button class="btn-close" id="btnCloseSummary">✕</button>
+      </div>
+      <div class="modal-body">
+        <textarea id="summaryTextarea" class="summary-textarea" readonly></textarea>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCopySummary" class="btn btn-secondary">📋 Copiar Ata</button>
+        <button id="btnExportFromSummary" class="btn btn-primary">💾 Salvar Arquivo (.md)</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

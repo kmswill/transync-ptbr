@@ -1,0 +1,30 @@
+{
+  "name": "transync-ptbr",
+  "version": "1.0.0",
+  "description": "Clone gratuito e open-source do Transync AI para tradução e transcrição simultânea em tempo real (Português do Brasil PT-BR ⇄ Espanhol ES) no Microsoft Teams, com captura nativa WASAPI Process Loopback (sem eco) e legenda flutuante PiP Always-on-Top.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "realtime-translation",
+    "transcription",
+    "microsoft-teams",
+    "pt-BR",
+    "spanish",
+    "wasapi-loopback",
+    "whisper",
+    "electron",
+    "transync"
+  ],
+  "author": "kmswill",
+  "license": "MIT",
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2",
+    "rea-agents": "file:../REA"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}
