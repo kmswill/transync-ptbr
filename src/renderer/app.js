@@ -575,10 +575,17 @@
   // Inicialização
   api.getState().then(async (state) => {
     currentGlossary = state.glossary || [];
+    if (state.groqFreeApiKey && inpGroqKey) {
+      inpGroqKey.value = state.groqFreeApiKey;
+    }
     await refreshRunningApps(state.targetApp || 'teams-only');
     selTeamsLang.value = state.teamsExpectedLang || 'auto';
     selMicLang.value = state.micExpectedLang || 'pt-BR';
-    selWhisperModel.value = state.whisperModel || 'Xenova/whisper-tiny';
+    selWhisperModel.value = state.whisperModel || 'groq/whisper-large-v3-turbo';
+    if (state.hasGroqKey) {
+      modelStatusDot.className = 'status-dot ready';
+      modelStatusText.textContent = '🚀 Motor Groq Whisper-Large-v3-Turbo Ativo (~0.3s • Grátis)';
+    }
     if (Array.isArray(state.entries)) {
       state.entries.forEach((entry) => renderUtterance(entry));
     }

@@ -29,23 +29,23 @@ const sttEngine = new HybridFreeSttEngine({
 
 const systemVad = new RealtimeVadSegmenter({
   source: 'system',
-  speechThresholdRms: 0.014,
-  silenceHangoverMs: 450,
-  softCutStartMs: 3200,
+  speechThresholdRms: 0.013,
+  silenceHangoverMs: 360,
+  softCutStartMs: 2400,
   softCutSilenceMs: 64,
-  minSpeechMs: 380,
-  maxSegmentMs: 8000,
+  minSpeechMs: 340,
+  maxSegmentMs: 5200,
   partialIntervalMs: 0
 });
 
 const micVad = new RealtimeVadSegmenter({
   source: 'mic',
-  speechThresholdRms: 0.020,
-  silenceHangoverMs: 450,
-  softCutStartMs: 3200,
+  speechThresholdRms: 0.018,
+  silenceHangoverMs: 360,
+  softCutStartMs: 2400,
   softCutSilenceMs: 64,
-  minSpeechMs: 420,
-  maxSegmentMs: 8000,
+  minSpeechMs: 360,
+  maxSegmentMs: 5200,
   partialIntervalMs: 0
 });
 
@@ -56,7 +56,7 @@ const appState = {
   captureMicAudio: true,
   targetApp: 'teams-only',
   engineMode: 'hybrid-free',
-  whisperModel: 'Xenova/whisper-tiny',
+  whisperModel: 'groq/whisper-large-v3-turbo',
   teamsExpectedLang: 'auto',
   micExpectedLang: 'pt-BR',
   contextNote: 'Reunião Microsoft Teams (Time Espanhol ⇄ Português do Brasil PT-BR)',
@@ -66,6 +66,77 @@ const appState = {
   pipOpacity: 92,
   pipFontSize: 16
 };
+
+function getSettingsFilePath() {
+  try {
+    return path.join(app.getPath('userData'), 'user-settings.json');
+  } catch {
+    return path.resolve(__dirname, '..', '..', '.cache', 'user-settings.json');
+  }
+}
+
+function loadPersistedSettings() {
+  // 1. Tenta ler .env local ignorado pelo Git
+  const envCandidates = [
+    path.resolve(__dirname, '..', '..', '.env'),
+    process.resourcesPath ? path.join(process.resourcesPath, 'app', '.env') : null
+  ].filter(Boolean);
+
+  for (const envPath of envCandidates) {
+    try {
+      if (fs.existsSync(envPath)) {
+        const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+        for (const line of lines) {
+          const m = line.match(/^\s*GROQ_API_KEY\s*=\s*(.+)\s*$/);
+          if (m && m[1]) {
+            sttEngine.setConfig({ groqFreeApiKey: m[1].trim() });
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Tenta ler user-settings.json do diretório userData
+  try {
+    const settingsPath = getSettingsFilePath();
+    if (fs.existsSync(settingsPath)) {
+      const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      if (saved.groqFreeApiKey) {
+        sttEngine.setConfig({ groqFreeApiKey: String(saved.groqFreeApiKey).trim() });
+      }
+      if (saved.targetApp) appState.targetApp = saved.targetApp;
+      if (saved.teamsExpectedLang) appState.teamsExpectedLang = saved.teamsExpectedLang;
+      if (saved.micExpectedLang) appState.micExpectedLang = saved.micExpectedLang;
+      if (saved.whisperModel) appState.whisperModel = saved.whisperModel;
+      if (Array.isArray(saved.glossary) && saved.glossary.length > 0) {
+        appState.glossary = saved.glossary;
+      }
+    }
+  } catch {}
+}
+
+function savePersistedSettings() {
+  try {
+    const settingsPath = getSettingsFilePath();
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        {
+          groqFreeApiKey: sttEngine.groqFreeApiKey || '',
+          whisperModel: appState.whisperModel,
+          targetApp: appState.targetApp,
+          teamsExpectedLang: appState.teamsExpectedLang,
+          micExpectedLang: appState.micExpectedLang,
+          glossary: appState.glossary
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {}
+}
 
 // Controle anti-repetição (evita cartões duplicados ou eco do alto-falante no microfone)
 const recentUtteranceFingerprints = [];
@@ -401,7 +472,9 @@ function getPublicState() {
     captureMicAudio: appState.captureMicAudio,
     targetApp: appState.targetApp,
     engineMode: appState.engineMode,
-    whisperModel: appState.whisperModel,
+    whisperModel: sttEngine.hasGroqKey() ? 'groq/whisper-large-v3-turbo' : appState.whisperModel,
+    hasGroqKey: sttEngine.hasGroqKey(),
+    groqFreeApiKey: sttEngine.groqFreeApiKey || '',
     teamsExpectedLang: appState.teamsExpectedLang,
     micExpectedLang: appState.micExpectedLang,
     contextNote: appState.contextNote,
@@ -496,10 +569,16 @@ function registerIpcHandlers() {
       micExpectedLang: config.micExpectedLang || appState.micExpectedLang
     });
 
+    const nextGroqKey =
+      typeof config.groqFreeApiKey === 'string' && config.groqFreeApiKey.trim()
+        ? config.groqFreeApiKey.trim()
+        : sttEngine.groqFreeApiKey;
+
     sttEngine.setConfig({
       modelId: appState.whisperModel,
-      groqFreeApiKey: config.groqFreeApiKey
+      groqFreeApiKey: nextGroqKey
     });
+    savePersistedSettings();
 
     systemVad.reset();
     micVad.reset();
@@ -691,6 +770,7 @@ function registerIpcHandlers() {
         await startConfiguredLoopback();
       } catch {}
     }
+    savePersistedSettings();
     broadcastToWindows('transync:session-state', getPublicState());
     return { ok: true, state: getPublicState() };
   });
@@ -750,6 +830,7 @@ app.whenReady().then(() => {
   try {
     sttEngine.cacheDir = path.join(app.getPath('userData'), 'models-cache');
   } catch {}
+  loadPersistedSettings();
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     const allowed = ['media', 'audioCapture', 'notifications', 'clipboard-sanitized-write'];
     callback(allowed.includes(permission));
