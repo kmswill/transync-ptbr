@@ -52,7 +52,8 @@ const SPANISH_WORDS = new Set([
   'año', 'presupuesto', 'facturación', 'despliegue', 'pantalla', 'archivo',
   'correo', 'clientes', 'proyecto', 'tareas', 'pendientes', 'listo', 'claro',
   'gracias', 'hola', 'muchas', 'mucho', 'poco', 'puede', 'pueden', 'podemos',
-  'quiero', 'queremos', 'necesito', 'necesitamos', 'vamos', 'hablar', 'decir'
+  'quiero', 'queremos', 'necesito', 'necesitamos', 'vamos', 'hablar', 'decir',
+  'con', 'del', 'al', 'por', 'para', 'sin', 'sobre', 'entre', 'hasta', 'desde'
 ]);
 
 const PORTUGUESE_BR_WORDS = new Set([
@@ -65,7 +66,7 @@ const PORTUGUESE_BR_WORDS = new Set([
   'tela', 'arquivo', 'clientes', 'projeto', 'tarefas', 'pendentes', 'pronto',
   'obrigado', 'obrigada', 'olá', 'oi', 'pode', 'podem', 'podemos', 'quero',
   'queremos', 'preciso', 'precisamos', 'falar', 'dizer', 'isso', 'isto',
-  'aqui', 'aí', 'lá', 'pra', 'pro', 'tá', 'né'
+  'aqui', 'aí', 'lá', 'pra', 'pro', 'tá', 'né', 'com', 'pelo', 'pela', 'dos', 'das'
 ]);
 
 /**
@@ -89,13 +90,12 @@ const DEFAULT_GLOSSARY = [
 function detectLanguagePtBrOrEs(text, hint = 'auto') {
   const clean = String(text || '').trim();
   if (!clean) {
-    return hint === 'es' || hint === 'es-419' || hint === 'es-ES' ? 'es' : 'pt-BR';
+    return hint && hint.startsWith('pt') ? 'pt-BR' : 'es';
   }
 
   let esScore = 0;
   let ptScore = 0;
 
-  // Marcadores ortográficos exclusivos ou fortes
   if (/[ñ¿¡]/i.test(clean)) esScore += 4;
   if (/[ãõç]/i.test(clean)) ptScore += 4;
   if (/\b\w+ción\b/i.test(clean)) esScore += 2.5;
@@ -115,8 +115,8 @@ function detectLanguagePtBrOrEs(text, hint = 'auto') {
   }
 
   if (esScore === ptScore) {
-    if (hint && hint.startsWith('es')) return 'es';
     if (hint && hint.startsWith('pt')) return 'pt-BR';
+    return 'es';
   }
 
   return esScore > ptScore ? 'es' : 'pt-BR';
@@ -151,9 +151,32 @@ function applyGlossary(text, direction, customGlossary = []) {
   return out;
 }
 
+async function queryGoogleGtx(text, sl, tl) {
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const segments = Array.isArray(data?.[0]) ? data[0] : [];
+    const translated = segments.map((seg) => seg?.[0] || '').join('').trim();
+    const detectedLang = String(data?.[2] || sl || '').toLowerCase();
+    return { translated, detectedLang };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
  * Traduz gratuitamente entre Espanhol (es) e Português do Brasil (pt-BR)
- * sem consumir tokens pagos, usando endpoint GTX gratuito + fallback MyMemory.
+ * sem consumir tokens pagos, usando detecção neural (sl=auto) do endpoint GTX + fallback MyMemory.
  */
 async function translateBidirectionalPtBrEs(text, options = {}) {
   const cleanText = String(text || '').trim();
@@ -169,55 +192,64 @@ async function translateBidirectionalPtBrEs(text, options = {}) {
 
   const hintLang = options.sourceLangHint || 'auto';
   const localDetected = detectLanguagePtBrOrEs(cleanText, hintLang);
-  const sourceLang =
+  let sourceLang =
     options.forceSourceLang && options.forceSourceLang !== 'auto'
       ? options.forceSourceLang.startsWith('es')
         ? 'es'
         : 'pt-BR'
       : localDetected;
 
-  const targetLang = sourceLang === 'es' ? 'pt-BR' : 'es';
-  const direction = `${sourceLang}->${targetLang}`;
+  let targetLang = sourceLang === 'es' ? 'pt-BR' : 'es';
 
-  // 1. Tenta Google Translate GTX (gratuito, sem chave, suporte explícito a pt-BR e es)
+  // 1. Google Translate GTX com sl=auto para confirmar idioma real e nunca devolver frase sem traduzir
   try {
-    const slParam = sourceLang === 'es' ? 'es' : 'pt';
-    const tlParam = targetLang === 'pt-BR' ? 'pt-BR' : 'es';
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${slParam}&tl=${tlParam}&dt=t&q=${encodeURIComponent(cleanText)}`;
+    const initialTl = targetLang === 'pt-BR' ? 'pt-BR' : 'es';
+    let gtx = await queryGoogleGtx(cleanText, 'auto', initialTl);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4500);
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-      },
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
+    if (gtx && gtx.translated) {
+      const googleDetectedPt = gtx.detectedLang.startsWith('pt');
 
-    if (response.ok) {
-      const data = await response.json();
-      const segments = Array.isArray(data?.[0]) ? data[0] : [];
-      let translated = segments.map((seg) => seg?.[0] || '').join('').trim();
-
-      if (translated) {
-        if (targetLang === 'pt-BR') {
-          translated = normalizeToBrazilianPortuguese(translated);
+      // Se Google detectou que o texto original era Português, mas havíamos pedido tl=pt-BR,
+      // refazemos imediatamente para tl=es (Português -> Espanhol)
+      if (googleDetectedPt && initialTl === 'pt-BR') {
+        sourceLang = 'pt-BR';
+        targetLang = 'es';
+        const retryEs = await queryGoogleGtx(cleanText, 'pt', 'es');
+        if (retryEs && retryEs.translated) {
+          gtx = retryEs;
         }
-        translated = applyGlossary(translated, direction, options.glossary);
-        return {
-          sourceText: cleanText,
-          translatedText: translated,
-          sourceLang,
-          targetLang,
-          provider: 'google-gtx-free'
-        };
+      } else if (!googleDetectedPt && initialTl === 'es') {
+        // Se Google detectou Espanhol (ou outro idioma) mas havíamos pedido tl=es, traduz para pt-BR
+        sourceLang = 'es';
+        targetLang = 'pt-BR';
+        const retryPt = await queryGoogleGtx(cleanText, 'auto', 'pt-BR');
+        if (retryPt && retryPt.translated) {
+          gtx = retryPt;
+        }
+      } else {
+        sourceLang = googleDetectedPt ? 'pt-BR' : 'es';
+        targetLang = sourceLang === 'es' ? 'pt-BR' : 'es';
       }
+
+      const direction = `${sourceLang}->${targetLang}`;
+      let translated = gtx.translated;
+      if (targetLang === 'pt-BR') {
+        translated = normalizeToBrazilianPortuguese(translated);
+      }
+      translated = applyGlossary(translated, direction, options.glossary);
+      return {
+        sourceText: cleanText,
+        translatedText: translated,
+        sourceLang,
+        targetLang,
+        provider: 'google-gtx-free'
+      };
     }
   } catch {
     // Passa para o fallback gratuito MyMemory
   }
+
+  const direction = `${sourceLang}->${targetLang}`;
 
   // 2. Fallback: MyMemory Translated Free API
   try {

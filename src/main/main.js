@@ -28,19 +28,23 @@ const sttEngine = new HybridFreeSttEngine({
 
 const systemVad = new RealtimeVadSegmenter({
   source: 'system',
-  speechThresholdRms: 0.011,
-  silenceHangoverMs: 360,
-  minSpeechMs: 300,
-  maxSegmentMs: 3500,
+  speechThresholdRms: 0.014,
+  silenceHangoverMs: 450,
+  softCutStartMs: 3200,
+  softCutSilenceMs: 64,
+  minSpeechMs: 380,
+  maxSegmentMs: 8000,
   partialIntervalMs: 0
 });
 
 const micVad = new RealtimeVadSegmenter({
   source: 'mic',
-  speechThresholdRms: 0.014,
-  silenceHangoverMs: 360,
-  minSpeechMs: 300,
-  maxSegmentMs: 3500,
+  speechThresholdRms: 0.020,
+  silenceHangoverMs: 450,
+  softCutStartMs: 3200,
+  softCutSilenceMs: 64,
+  minSpeechMs: 420,
+  maxSegmentMs: 8000,
   partialIntervalMs: 0
 });
 
@@ -51,7 +55,7 @@ const appState = {
   captureMicAudio: true,
   engineMode: 'hybrid-free',
   whisperModel: 'Xenova/whisper-tiny',
-  teamsExpectedLang: 'es',
+  teamsExpectedLang: 'auto',
   micExpectedLang: 'pt-BR',
   contextNote: 'Reunião Microsoft Teams (Time Espanhol ⇄ Português do Brasil PT-BR)',
   glossary: [...DEFAULT_GLOSSARY],
@@ -60,6 +64,45 @@ const appState = {
   pipOpacity: 92,
   pipFontSize: 16
 };
+
+// Controle anti-repetição (evita cartões duplicados ou eco do alto-falante no microfone)
+const recentUtteranceFingerprints = [];
+let lastSystemActiveAt = 0;
+
+function normalizeFingerprint(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+function isDuplicateRecentUtterance(text) {
+  const fp = normalizeFingerprint(text);
+  if (!fp || fp.replace(/\s+/g, '').length < 3) return true;
+
+  const now = Date.now();
+  while (recentUtteranceFingerprints.length > 0 && now - recentUtteranceFingerprints[0].time > 12000) {
+    recentUtteranceFingerprints.shift();
+  }
+
+  for (const item of recentUtteranceFingerprints) {
+    if (item.fp === fp) {
+      return true;
+    }
+    // Se uma frase curta inteira (>6 letras) já está contida literalmente na anterior recente (3.5s)
+    if (
+      now - item.time < 3500 &&
+      fp.length >= 6 &&
+      (item.fp.includes(fp) || fp.includes(item.fp)) &&
+      Math.abs(item.fp.length - fp.length) <= 8
+    ) {
+      return true;
+    }
+  }
+
+  recentUtteranceFingerprints.push({ fp, time: now });
+  return false;
+}
 
 function broadcastToWindows(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
@@ -83,13 +126,15 @@ async function processRecognizedText({
   utteranceId,
   source,
   rawText,
-  isPartial = false
+  isPartial = false,
+  bypassDedup = false
 }) {
   const cleanText = String(rawText || '').trim();
   if (!cleanText) {
-    if (utteranceId) {
-      broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
-    }
+    return null;
+  }
+
+  if (!isPartial && !bypassDedup && isDuplicateRecentUtterance(cleanText)) {
     return null;
   }
 
@@ -97,10 +142,14 @@ async function processRecognizedText({
     source === 'system' ? appState.teamsExpectedLang : appState.micExpectedLang;
 
   const translation = await translateBidirectionalPtBrEs(cleanText, {
-    sourceLangHint: expectedLang === 'auto' ? (source === 'system' ? 'es' : 'pt-BR') : expectedLang,
+    sourceLangHint: expectedLang,
     forceSourceLang: expectedLang === 'auto' ? null : expectedLang,
     glossary: appState.glossary
   });
+
+  if (!translation.translatedText) {
+    return null;
+  }
 
   const entry = {
     id: utteranceId || `${source}_${Date.now()}`,
@@ -131,23 +180,11 @@ async function processRecognizedText({
   return entry;
 }
 
-function sendListeningPlaceholder({ source, utteranceId }) {
-  if (!appState.running || appState.paused) return;
-  const expectedLang =
-    source === 'system' ? appState.teamsExpectedLang : appState.micExpectedLang;
-  const srcLang = expectedLang === 'pt-BR' ? 'pt-BR' : 'es';
-  const tgtLang = srcLang === 'es' ? 'pt-BR' : 'es';
-
-  broadcastToWindows('transync:utterance', {
-    id: utteranceId,
-    source,
-    speakerName: source === 'system' ? 'Áudio do PC / Teams' : 'Você (Microfone)',
-    timestamp: formatNowTime(),
-    sourceText: '🎙️ Ouvindo fala ao vivo (capturando frase)...',
-    translatedText: '⚡ Traduzindo em instantes (~1s)...',
-    sourceLang: srcLang,
-    targetLang: tgtLang,
-    isPartial: true
+function broadcastLiveStatus(status, message) {
+  broadcastToWindows('transync:model-status', {
+    type: 'model-status',
+    status,
+    message
   });
 }
 
@@ -156,20 +193,21 @@ async function handleVadSegment(segment, isPartial) {
 
   const languageHint =
     segment.source === 'system'
-      ? appState.teamsExpectedLang === 'pt-BR'
-        ? 'pt-BR'
-        : 'es'
-      : appState.micExpectedLang === 'es'
-        ? 'es'
-        : 'pt-BR';
+      ? appState.teamsExpectedLang || 'auto'
+      : appState.micExpectedLang || 'pt-BR';
+
+  const sourceLabel = segment.source === 'system' ? 'Teams / PC' : 'Microfone';
+  broadcastLiveStatus('loading', `⚡ Transcrevendo e traduzindo fala (${sourceLabel})...`);
 
   try {
     const text = await sttEngine.transcribeSegment({
+      source: segment.source,
       int16Samples: segment.int16Samples,
       float32Samples: segment.float32Samples,
       languageHint,
       isPartial
     });
+
     if (text) {
       await processRecognizedText({
         utteranceId: segment.utteranceId,
@@ -177,29 +215,36 @@ async function handleVadSegment(segment, isPartial) {
         rawText: text,
         isPartial
       });
-    } else if (segment.utteranceId) {
-      broadcastToWindows('transync:remove-placeholder', { id: segment.utteranceId });
+    }
+
+    if (!sttEngine.isBusy()) {
+      broadcastLiveStatus(
+        'ready',
+        `✓ Escutando em tempo real (${appState.whisperModel} • Zero Tokens)`
+      );
     }
   } catch (err) {
-    if (segment.utteranceId) {
-      broadcastToWindows('transync:remove-placeholder', { id: segment.utteranceId });
-    }
-    broadcastToWindows('transync:model-status', {
-      type: 'model-status',
-      status: 'warn',
-      message: `Aviso STT (${segment.source}): ${err.message}`
-    });
+    broadcastLiveStatus('warn', `Aviso STT (${segment.source}): ${err.message}`);
   }
 }
 
 systemVad.on('level', (lvl) => {
   if (appState.running && !appState.paused) {
+    if (lvl.rms >= 0.014) {
+      lastSystemActiveAt = Date.now();
+    }
     broadcastToWindows('transync:audio-level', lvl);
   }
 });
-systemVad.on('speech-start', (info) => sendListeningPlaceholder(info));
-systemVad.on('speech-cancel', ({ utteranceId }) => {
-  if (utteranceId) broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
+systemVad.on('speech-start', () => {
+  if (appState.running && !appState.paused) {
+    broadcastLiveStatus('loading', '🎧 Captando fala no Áudio do PC / Teams...');
+  }
+});
+systemVad.on('speech-cancel', () => {
+  if (appState.running && !appState.paused && !sttEngine.isBusy()) {
+    broadcastLiveStatus('ready', `✓ Escutando em tempo real (${appState.whisperModel} • Zero Tokens)`);
+  }
 });
 systemVad.on('final', (seg) => handleVadSegment(seg, false));
 
@@ -208,9 +253,15 @@ micVad.on('level', (lvl) => {
     broadcastToWindows('transync:audio-level', lvl);
   }
 });
-micVad.on('speech-start', (info) => sendListeningPlaceholder(info));
-micVad.on('speech-cancel', ({ utteranceId }) => {
-  if (utteranceId) broadcastToWindows('transync:remove-placeholder', { id: utteranceId });
+micVad.on('speech-start', () => {
+  if (appState.running && !appState.paused) {
+    broadcastLiveStatus('loading', '🎙️ Captando sua fala no Microfone...');
+  }
+});
+micVad.on('speech-cancel', () => {
+  if (appState.running && !appState.paused && !sttEngine.isBusy()) {
+    broadcastLiveStatus('ready', `✓ Escutando em tempo real (${appState.whisperModel} • Zero Tokens)`);
+  }
 });
 micVad.on('final', (seg) => handleVadSegment(seg, false));
 
@@ -380,6 +431,7 @@ function registerIpcHandlers() {
 
     systemVad.reset();
     micVad.reset();
+    sttEngine.clearQueue();
     appState.running = true;
     appState.paused = false;
 
@@ -397,7 +449,6 @@ function registerIpcHandlers() {
     }
 
     sttEngine.preloadModel(appState.whisperModel);
-
     broadcastToWindows('transync:session-state', getPublicState());
     return {
       ok: true,
@@ -417,17 +468,24 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('transync:stop-session', async () => {
-    systemVad.flushCurrentUtterance();
-    micVad.flushCurrentUtterance();
     appState.running = false;
     appState.paused = false;
+    systemVad.reset();
+    micVad.reset();
+    sttEngine.clearQueue();
     await loopbackCapture.stop();
+    broadcastLiveStatus('ready', `Motor ${appState.whisperModel} pronto (Sessão parada)`);
     broadcastToWindows('transync:session-state', getPublicState());
     return { ok: true, state: getPublicState() };
   });
 
   ipcMain.on('transync:mic-pcm', (_event, int16ArrayPayload) => {
     if (!appState.running || appState.paused || !appState.captureMicAudio) return;
+    // Se o áudio do PC / Teams estiver falando alto neste exato instante (< 280ms),
+    // evita que o microfone do notebook re-capture o som das caixas de som do PC (anti-eco)
+    if (appState.captureSystemAudio && Date.now() - lastSystemActiveAt < 280) {
+      return;
+    }
     const samples =
       int16ArrayPayload instanceof Int16Array
         ? int16ArrayPayload
@@ -447,8 +505,7 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('transync:run-demo-test', async () => {
-    const demoId = `demo_${Date.now()}`;
-    sendListeningPlaceholder({ source: 'system', utteranceId: demoId });
+    broadcastLiveStatus('loading', '🧪 Executando teste de transcrição e tradução PT-BR ⇄ ES...');
 
     const tmpWav = path.join(os.tmpdir(), `transync_demo_${Date.now()}.wav`);
     const ps = `
@@ -463,47 +520,51 @@ function registerIpcHandlers() {
     return new Promise((resolve) => {
       execFile('powershell.exe', ['-NoProfile', '-Command', ps], async (err) => {
         try {
-          if (err || !fs.existsSync(tmpWav)) {
-            const entry = await processRecognizedText({
-              utteranceId: demoId,
-              source: 'system',
-              rawText: 'Hola equipo, necesitamos revisar el presupuesto y compartir pantalla en la reunión de hoy.',
+          let transcribed = '';
+          let elapsedMs = 0;
+          if (!err && fs.existsSync(tmpWav)) {
+            const wavBuf = fs.readFileSync(tmpWav);
+            try { fs.unlinkSync(tmpWav); } catch {}
+            const pcmInt16 = new Int16Array(
+              wavBuf.buffer,
+              wavBuf.byteOffset + 44,
+              Math.floor((wavBuf.byteLength - 44) / 2)
+            );
+            const float32 = int16ToFloat32(pcmInt16);
+            const t0 = Date.now();
+            transcribed = await sttEngine.transcribeSegment({
+              source: 'mic',
+              int16Samples: pcmInt16,
+              float32Samples: float32,
+              languageHint: 'pt-BR',
               isPartial: false
             });
-            resolve({ ok: true, entry });
-            return;
+            elapsedMs = Date.now() - t0;
           }
-          const wavBuf = fs.readFileSync(tmpWav);
-          try { fs.unlinkSync(tmpWav); } catch {}
-          const pcmInt16 = new Int16Array(
-            wavBuf.buffer,
-            wavBuf.byteOffset + 44,
-            Math.floor((wavBuf.byteLength - 44) / 2)
-          );
-          const float32 = int16ToFloat32(pcmInt16);
-          const t0 = Date.now();
-          const transcribed = await sttEngine.transcribeSegment({
-            int16Samples: pcmInt16,
-            float32Samples: float32,
-            languageHint: 'pt-BR',
-            isPartial: false
-          });
-          const elapsedMs = Date.now() - t0;
+
           const entry = await processRecognizedText({
-            utteranceId: demoId,
+            utteranceId: `demo_pt_${Date.now()}`,
             source: 'mic',
-            rawText: transcribed || 'Olá equipe, precisamos revisar o orçamento e compartilhar a tela na reunião.',
-            isPartial: false
+            rawText:
+              transcribed ||
+              'Olá equipe, precisamos revisar o orçamento e compartilhar a tela na reunião.',
+            isPartial: false,
+            bypassDedup: true
           });
-          // E simula também a resposta do colega em Espanhol no Teams!
+
           const replyEntry = await processRecognizedText({
-            utteranceId: `demo_es_${Date.now()}`,
+            utteranceId: `demo_es_${Date.now() + 1}`,
             source: 'system',
-            rawText: 'Perfecto, ya actualicé el presupuesto del proyecto y ahora voy a compartir mi pantalla con el equipo.',
-            isPartial: false
+            rawText:
+              'Perfecto, ya actualicé el presupuesto del proyecto y ahora voy a compartir mi pantalla con todo el equipo.',
+            isPartial: false,
+            bypassDedup: true
           });
+
+          broadcastLiveStatus('ready', `✓ Teste concluído em ${(elapsedMs / 1000).toFixed(1)}s!`);
           resolve({ ok: true, elapsedMs, entry, replyEntry });
         } catch (e) {
+          broadcastLiveStatus('warn', `Erro no teste: ${e.message}`);
           resolve({ ok: false, error: e.message });
         }
       });
@@ -511,7 +572,8 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('transync:quick-translate', async (_event, { text, direction }) => {
-    const forceSourceLang = direction === 'es->pt-BR' ? 'es' : direction === 'pt-BR->es' ? 'pt-BR' : 'auto';
+    const forceSourceLang =
+      direction === 'es->pt-BR' ? 'es' : direction === 'pt-BR->es' ? 'pt-BR' : 'auto';
     return await translateBidirectionalPtBrEs(text, {
       forceSourceLang,
       glossary: appState.glossary
@@ -553,6 +615,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle('transync:clear-entries', () => {
     appState.entries = [];
+    recentUtteranceFingerprints.length = 0;
     broadcastToWindows('transync:entries-cleared', {});
     return { ok: true };
   });
@@ -613,7 +676,6 @@ app.whenReady().then(() => {
   registerIpcHandlers();
   createMainWindow();
 
-  // Pré-aquece o motor Whisper imediatamente ao abrir o app para resposta instantânea (~1.2s)
   setTimeout(() => {
     sttEngine.preloadModel(appState.whisperModel);
   }, 300);

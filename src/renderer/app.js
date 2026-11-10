@@ -530,7 +530,7 @@
   // Inicialização
   api.getState().then((state) => {
     currentGlossary = state.glossary || [];
-    selTeamsLang.value = state.teamsExpectedLang || 'es';
+    selTeamsLang.value = state.teamsExpectedLang || 'auto';
     selMicLang.value = state.micExpectedLang || 'pt-BR';
     selWhisperModel.value = state.whisperModel || 'Xenova/whisper-tiny';
     if (Array.isArray(state.entries)) {

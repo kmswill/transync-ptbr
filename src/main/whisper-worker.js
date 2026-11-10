@@ -18,16 +18,76 @@ const WHISPER_HALLUCINATION_PATTERNS = [
   /^amara\.org/i,
   /^gracias por ver/i,
   /^suscríbete/i,
+  /^thank you for watching/i,
   /^\.+$/
 ];
 
-function isWhisperHallucination(text) {
-  const clean = String(text || '').trim();
-  if (!clean || clean.length < 2) return true;
+/**
+ * Remove loops de repetição do Whisper (ex: "Pioço de Pioço de..." ou "sí, sí, sí")
+ * e filtra alucinações de silêncio/ruído.
+ */
+function sanitizeWhisperText(rawText) {
+  let clean = String(rawText || '').replace(/\s+/g, ' ').trim();
+  if (!clean || clean.length < 2) return '';
+
   for (const pat of WHISPER_HALLUCINATION_PATTERNS) {
-    if (pat.test(clean)) return true;
+    if (pat.test(clean)) return '';
   }
-  return false;
+
+  // Remove qualquer sequência de 4+ caracteres que se repita 3+ vezes seguidas (mesmo sem espaço)
+  clean = clean.replace(/(.{4,30}?)(?:\s*\1){2,}/giu, '$1');
+
+  // Remove palavras ou pares de palavras repetidos em sequência
+  const words = clean.split(/\s+/);
+  const deduped = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    const prev1 = deduped[deduped.length - 1];
+    const prev2 = deduped[deduped.length - 2];
+    const normW = w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const normPrev1 = prev1 ? prev1.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') : '';
+    const normPrev2 = prev2 ? prev2.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') : '';
+
+    // Evita mesma palavra 2x seguidas (ex: "hola hola")
+    if (normW && normW === normPrev1 && normW.length >= 2) {
+      continue;
+    }
+    // Evita bigrama repetido (ex: "de pioço de pioço")
+    if (
+      normW &&
+      i + 1 < words.length &&
+      normW === normPrev2 &&
+      words[i + 1].toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') === normPrev1
+    ) {
+      i += 1;
+      continue;
+    }
+    deduped.push(w);
+  }
+
+  clean = deduped.join(' ').trim();
+  const lettersOnly = clean.replace(/[^\p{L}]/gu, '');
+  if (lettersOnly.length < 3) return '';
+
+  return clean;
+}
+
+/**
+ * Aplica fade-out suave nos últimos 25ms e adiciona 300ms de silêncio ao final do buffer
+ * para que o decodificador do Whisper perceba fim limpo de frase e não entre em loop.
+ */
+function padAudioWithCleanTail(audioArray) {
+  const fadeSamples = Math.min(400, audioArray.length); // 25ms a 16kHz
+  const tailSilenceSamples = 4800; // 300ms a 16kHz
+  const padded = new Float32Array(audioArray.length + tailSilenceSamples);
+  padded.set(audioArray, 0);
+
+  const startFade = audioArray.length - fadeSamples;
+  for (let i = 0; i < fadeSamples; i++) {
+    const factor = 1 - i / fadeSamples;
+    padded[startFade + i] *= factor;
+  }
+  return padded;
 }
 
 async function getTranscriber(modelId = 'Xenova/whisper-tiny', cacheDir = null) {
@@ -53,7 +113,7 @@ async function getTranscriber(modelId = 'Xenova/whisper-tiny', cacheDir = null) 
       type: 'model-status',
       status: 'loading',
       modelId,
-      message: `Carregando motor rápido ${modelId}...`
+      message: `Carregando motor ${modelId}...`
     });
 
     const instance = await pipeline('automatic-speech-recognition', modelId, {
@@ -75,7 +135,7 @@ async function getTranscriber(modelId = 'Xenova/whisper-tiny', cacheDir = null) 
       type: 'model-status',
       status: 'ready',
       modelId,
-      message: `Motor ${modelId} aquecido e pronto (~1.2s de resposta • Zero Tokens)`
+      message: `Motor ${modelId} pronto (Tempo Real • Zero Tokens)`
     });
     return instance;
   })();
@@ -110,13 +170,15 @@ parentPort?.on('message', async (msg) => {
       const audioArray =
         float32Audio instanceof Float32Array ? float32Audio : new Float32Array(float32Audio);
 
-      // Verificação rápida de energia mínima para nunca gastar CPU em silêncio
       let sumSq = 0;
+      let activeSamples = 0;
       for (let i = 0; i < audioArray.length; i++) {
-        sumSq += audioArray[i] * audioArray[i];
+        const v = audioArray[i];
+        sumSq += v * v;
+        if (Math.abs(v) > 0.018) activeSamples++;
       }
       const rms = Math.sqrt(sumSq / Math.max(1, audioArray.length));
-      if (rms < 0.004) {
+      if (rms < 0.006 || activeSamples < 16000 * 0.22) {
         parentPort?.postMessage({
           type: 'transcribe-result',
           requestId,
@@ -128,22 +190,29 @@ parentPort?.on('message', async (msg) => {
 
       const asr = await getTranscriber(modelId || 'Xenova/whisper-tiny', cacheDir);
 
-      const whisperLang =
-        languageHint && languageHint.startsWith('pt')
-          ? 'portuguese'
-          : languageHint && languageHint.startsWith('es')
-            ? 'spanish'
-            : 'spanish';
+      let whisperLang = null;
+      if (languageHint && languageHint !== 'auto') {
+        if (languageHint.startsWith('pt')) {
+          whisperLang = 'portuguese';
+        } else if (languageHint.startsWith('es')) {
+          whisperLang = 'spanish';
+        }
+      }
 
-      const result = await asr(audioArray, {
-        language: whisperLang,
+      const genOptions = {
         task: 'transcribe',
-        max_new_tokens: 56,
+        max_new_tokens: 64,
+        no_repeat_ngram_size: 3,
+        repetition_penalty: 1.15,
         return_timestamps: false
-      });
+      };
+      if (whisperLang) {
+        genOptions.language = whisperLang;
+      }
 
-      const rawText = String(result?.text || '').trim();
-      const text = isWhisperHallucination(rawText) ? '' : rawText;
+      const paddedAudio = padAudioWithCleanTail(audioArray);
+      const result = await asr(paddedAudio, genOptions);
+      const text = sanitizeWhisperText(result?.text || '');
 
       parentPort?.postMessage({
         type: 'transcribe-result',

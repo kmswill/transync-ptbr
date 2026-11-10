@@ -3,18 +3,28 @@
 const { EventEmitter } = require('node:events');
 const { Worker } = require('node:worker_threads');
 const path = require('node:path');
-const { encodeWav16kMono } = require('./vad-segmenter');
+const { encodeWav16kMono, concatInt16Chunks, int16ToFloat32 } = require('./vad-segmenter');
+
+const MAX_COALESCED_SAMPLES = 16000 * 11; // Máx 11s por lote combinado
+
+function concatFloat32(a, b) {
+  const out = new Float32Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
 
 class HybridFreeSttEngine extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.modelId = options.modelId || 'Xenova/whisper-base';
+    this.modelId = options.modelId || 'Xenova/whisper-tiny';
     this.cacheDir = options.cacheDir || path.resolve(__dirname, '..', '..', '.cache', 'models');
     this.groqFreeApiKey = options.groqFreeApiKey || '';
     this.worker = null;
-    this.pendingRequests = new Map();
+    this.activeRequests = new Map();
     this.reqCounter = 0;
-    this.busyCount = 0;
+    this.workerBusy = false;
+    this.coalescedQueue = []; // Fila inteligente (no máximo 1 item por source aguardando)
   }
 
   ensureWorker() {
@@ -32,34 +42,37 @@ class HybridFreeSttEngine extends EventEmitter {
         return;
       }
       if (msg.type === 'transcribe-result') {
-        const pending = this.pendingRequests.get(msg.requestId);
+        const pending = this.activeRequests.get(msg.requestId);
         if (pending) {
-          this.pendingRequests.delete(msg.requestId);
-          this.busyCount = Math.max(0, this.busyCount - 1);
+          this.activeRequests.delete(msg.requestId);
+          this.workerBusy = false;
           if (msg.ok) {
             pending.resolve(msg.text || '');
           } else {
             pending.reject(new Error(msg.error || 'Falha na transcrição Whisper'));
           }
+          this._drainQueue();
         }
       }
     });
 
     worker.on('error', (err) => {
+      this.workerBusy = false;
       this.emit('status', {
         type: 'model-status',
         status: 'error',
         message: `Worker Whisper erro: ${err.message}`
       });
+      this._drainQueue();
     });
 
     worker.on('exit', () => {
       this.worker = null;
-      this.busyCount = 0;
-      for (const [, pending] of this.pendingRequests) {
+      this.workerBusy = false;
+      for (const [, pending] of this.activeRequests) {
         pending.reject(new Error('Worker Whisper finalizado'));
       }
-      this.pendingRequests.clear();
+      this.activeRequests.clear();
     });
 
     this.worker = worker;
@@ -87,14 +100,35 @@ class HybridFreeSttEngine extends EventEmitter {
   }
 
   isBusy() {
-    return this.busyCount > 0;
+    return this.workerBusy || this.coalescedQueue.length > 0;
   }
 
-  async transcribeSegment({ int16Samples, float32Samples, languageHint = 'es', isPartial = false }) {
-    // Se for parcial e o motor já estiver processando um áudio, descarta o parcial antigo para manter latência mínima
-    if (isPartial && this.busyCount > 0) {
+  clearQueue() {
+    while (this.coalescedQueue.length > 0) {
+      const item = this.coalescedQueue.shift();
+      item.resolve('');
+    }
+  }
+
+  async transcribeSegment({
+    source = 'system',
+    int16Samples,
+    float32Samples,
+    languageHint = 'auto',
+    isPartial = false
+  }) {
+    if (isPartial && this.workerBusy) {
       return '';
     }
+
+    const f32 =
+      float32Samples instanceof Float32Array
+        ? float32Samples
+        : int16Samples
+          ? int16ToFloat32(int16Samples)
+          : new Float32Array(0);
+
+    if (f32.length === 0) return '';
 
     // Se o usuário tiver configurado chave gratuita opcional do Groq Whisper-Large-v3-Turbo
     if (this.groqFreeApiKey && int16Samples && !isPartial) {
@@ -102,40 +136,87 @@ class HybridFreeSttEngine extends EventEmitter {
         const text = await this.transcribeViaGroqFreeTier(int16Samples, languageHint);
         if (text) return text;
       } catch {
-        // Faz fallback transparente para o Whisper Local ONNX
+        // Fallback transparente para o Whisper Local ONNX
       }
     }
 
-    const worker = this.ensureWorker();
-    this.reqCounter += 1;
-    const requestId = `req_${Date.now()}_${this.reqCounter}`;
-    this.busyCount += 1;
-
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(requestId, { resolve, reject });
-      const copy = new Float32Array(float32Samples);
-      worker.postMessage(
-        {
-          type: 'transcribe',
-          requestId,
-          float32Audio: copy,
+      // Se o worker já estiver ocupado, funde segmentos pendentes da mesma fonte (evita fila infinita e frases picotadas)
+      if (this.workerBusy) {
+        const existingIdx = this.coalescedQueue.findIndex((q) => q.source === source);
+        if (existingIdx >= 0) {
+          const existing = this.coalescedQueue[existingIdx];
+          if (existing.float32Samples.length + f32.length <= MAX_COALESCED_SAMPLES) {
+            existing.float32Samples = concatFloat32(existing.float32Samples, f32);
+            if (existing.int16Samples && int16Samples) {
+              existing.int16Samples = concatInt16Chunks([existing.int16Samples, int16Samples]);
+            }
+            existing.languageHint = languageHint;
+            // Libera a promise anterior silenciosamente; a nova promise receberá o texto unido completo
+            existing.resolve('');
+            existing.resolve = resolve;
+            existing.reject = reject;
+            return;
+          }
+        }
+        this.coalescedQueue.push({
+          source,
+          int16Samples,
+          float32Samples: f32,
           languageHint,
-          modelId: this.modelId,
-          cacheDir: this.cacheDir
-        },
-        [copy.buffer]
-      );
+          resolve,
+          reject
+        });
+        return;
+      }
+
+      this._dispatchToWorker({
+        float32Samples: f32,
+        languageHint,
+        resolve,
+        reject
+      });
     });
   }
 
-  async transcribeViaGroqFreeTier(int16Samples, languageHint = 'es') {
+  _drainQueue() {
+    if (this.workerBusy || this.coalescedQueue.length === 0) return;
+    const next = this.coalescedQueue.shift();
+    if (!next) return;
+    this._dispatchToWorker(next);
+  }
+
+  _dispatchToWorker({ float32Samples, languageHint, resolve, reject }) {
+    const worker = this.ensureWorker();
+    this.reqCounter += 1;
+    const requestId = `req_${Date.now()}_${this.reqCounter}`;
+    this.workerBusy = true;
+
+    this.activeRequests.set(requestId, { resolve, reject });
+    const copy = new Float32Array(float32Samples);
+    worker.postMessage(
+      {
+        type: 'transcribe',
+        requestId,
+        float32Audio: copy,
+        languageHint,
+        modelId: this.modelId,
+        cacheDir: this.cacheDir
+      },
+      [copy.buffer]
+    );
+  }
+
+  async transcribeViaGroqFreeTier(int16Samples, languageHint = 'auto') {
     const wavBuffer = encodeWav16kMono(int16Samples);
     const formData = new FormData();
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     formData.append('file', blob, 'segment.wav');
     formData.append('model', 'whisper-large-v3-turbo');
-    const isoLang = languageHint.startsWith('pt') ? 'pt' : 'es';
-    formData.append('language', isoLang);
+    if (languageHint && languageHint !== 'auto') {
+      const isoLang = languageHint.startsWith('pt') ? 'pt' : 'es';
+      formData.append('language', isoLang);
+    }
     formData.append('response_format', 'json');
 
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -154,6 +235,7 @@ class HybridFreeSttEngine extends EventEmitter {
   }
 
   async destroy() {
+    this.clearQueue();
     if (this.worker) {
       await this.worker.terminate();
       this.worker = null;
