@@ -489,10 +489,11 @@ function getPublicState() {
 }
 
 /**
- * Inicia a captura de áudio WASAPI conforme o filtro de aplicativo escolhido:
- * - 'teams-only': trava exclusivamente no Microsoft Teams (se aberto) ou navegador com Teams/vídeo
- * - 'exe:<nome.exe>': trava exclusivamente naquele aplicativo (ignora notificações, WhatsApp, e-mail etc.)
- * - 'all': ouve todo o PC exceto o próprio Transync
+ * Inicia a captura de áudio WASAPI:
+ * Utiliza SEMPRE 'exclude-tree' com o PID do próprio Transync, exatamente como o Transync AI original.
+ * Isso garante que QUALQUER áudio reproduzido nos alto-falantes / fone (chamada do Teams,
+ * reunião no navegador, YouTube, etc.) seja capturado com 100% de confiabilidade,
+ * enquanto os sons do próprio Transync são excluídos para evitar microfonia/eco.
  */
 async function startConfiguredLoopback() {
   if (!appState.captureSystemAudio || !loopbackCapture.isAvailable()) {
@@ -500,50 +501,8 @@ async function startConfiguredLoopback() {
     return { started: false, mode: 'disabled' };
   }
 
-  const targetApp = appState.targetApp || 'teams-only';
-  if (targetApp !== 'all') {
-    const runningApps = await listRunningAudioApps();
-    let chosenApp = null;
-
-    if (targetApp === 'teams-only') {
-      chosenApp =
-        runningApps.find(
-          (a) => a.exe.toLowerCase() === 'ms-teams.exe' || a.exe.toLowerCase() === 'teams.exe'
-        ) || null;
-
-      if (!chosenApp) {
-        // O usuário pediu especificamente "Só Teams", mas o Teams não está aberto!
-        // NÃO faz fallback para ouvir o PC inteiro (senão o YouTube/notificações vazam).
-        // Em vez disso, silencia a captura do sistema e avisa claramente o usuário.
-        await loopbackCapture.stop();
-        broadcastLiveStatus(
-          'warn',
-          '⚠️ Modo "Só Microsoft Teams" ativo: abra o Teams para capturar. Outros apps (YouTube/notificações) estão bloqueados.'
-        );
-        return { started: false, mode: 'teams-not-running' };
-      }
-    } else if (targetApp.startsWith('exe:')) {
-      const wantedExe = targetApp.slice(4).toLowerCase();
-      chosenApp = runningApps.find((a) => a.exe.toLowerCase() === wantedExe) || null;
-    } else if (targetApp.startsWith('pid:')) {
-      const pidNum = Number.parseInt(targetApp.slice(4), 10);
-      if (Number.isInteger(pidNum) && pidNum > 0) {
-        chosenApp = { exe: `PID ${pidNum}`, rootPid: pidNum };
-      }
-    }
-
-    if (chosenApp && chosenApp.rootPid) {
-      const status = await loopbackCapture.start(chosenApp.rootPid, 'include-tree');
-      broadcastLiveStatus(
-        'ready',
-        `🎯 Áudio travado SOMENTE em ${chosenApp.exe} (PID ${chosenApp.rootPid}) — notificações ignoradas`
-      );
-      return status;
-    }
-  }
-
   const status = await loopbackCapture.start(process.pid, 'exclude-tree');
-  broadcastLiveStatus('ready', `🔊 Ouvindo áudio geral do PC (${appState.whisperModel})`);
+  broadcastLiveStatus('ready', `🎧 Áudio do PC / Teams ativo (${appState.whisperModel})`);
   return status;
 }
 
