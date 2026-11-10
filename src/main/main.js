@@ -512,13 +512,15 @@ async function startConfiguredLoopback() {
         ) || null;
 
       if (!chosenApp) {
-        // Se o app desktop do Teams não estiver aberto no momento, avisa e usa captura geral sem travar a sessão
-        const status = await loopbackCapture.start(process.pid, 'exclude-tree');
+        // O usuário pediu especificamente "Só Teams", mas o Teams não está aberto!
+        // NÃO faz fallback para ouvir o PC inteiro (senão o YouTube/notificações vazam).
+        // Em vez disso, silencia a captura do sistema e avisa claramente o usuário.
+        await loopbackCapture.stop();
         broadcastLiveStatus(
-          'ready',
-          'ℹ️ Microsoft Teams não detectado aberto agora — ouvindo áudio do PC (abra o Teams para isolar)'
+          'warn',
+          '⚠️ Modo "Só Microsoft Teams" ativo: abra o Teams para capturar. Outros apps (YouTube/notificações) estão bloqueados.'
         );
-        return status;
+        return { started: false, mode: 'teams-not-running' };
       }
     } else if (targetApp.startsWith('exe:')) {
       const wantedExe = targetApp.slice(4).toLowerCase();
